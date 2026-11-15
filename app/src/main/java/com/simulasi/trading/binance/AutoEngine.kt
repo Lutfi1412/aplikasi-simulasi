@@ -33,14 +33,21 @@ import kotlin.math.min
 /**
  * Eksekutor Binance + aturan automation yang hanya berjalan di aplikasi.
  *
- * Pembagian tugas (sesuai aturan main):
- *  - Patokan +22% / +34% / +50% / +15% berikutnya dan -22% / -31% adalah **level di aplikasi**.
- *    Saat ROI menyentuhnya, engine menutup posisi lalu mengecek 25 menit apakah model masih
- *    selaras; kalau ya, entry lagi di leverage tangga berikutnya, kalau tidak, netral.
+ * Pembagian tugas (revisi #28, aturan final):
+ *  - Sinyal 6 model dikumpulkan dalam window **30 menit**. Skema izin entry/lanjut:
+ *    semua 6 menjawab, **≥4 selaras**, **≥2 model selaras ROI ≥48%**, dan **semua model
+ *    tidak selaras ROI ≤35%**. Kurang satu syarat = izin 4/6 batal.
+ *  - Window gagal (tidak lengkap atau skema batal) → sinyal 5 menit terakhir (menit 25–30)
+ *    dibawa sebagai carry, model lain dipaksa netral, window 30 menit baru langsung mulai.
+ *    Tidak ada fase tunggu/koreksi terpisah — engine berputar terus.
+ *  - Patokan +22% / +34% / +50% / +15% berikutnya dan -22% / -31% tetap **level di aplikasi**.
+ *    Saat tersentuh, posisi TETAP terbuka; 6 model dinetralkan dan dinilai ulang maksimal
+ *    25 menit. Lolos skema → lanjut (leverage naik), gagal → keluar. Kalau ≥4 model berbalik
+ *    arah, posisi lama ditutup dan order baru dibuka di arah berbalik (30x, level fresh).
  *  - Di exchange hanya dipasang **SL keras -40% ROI** (closePosition) sebagai pengaman
  *    terakhir kalau aplikasi/HP mati. Tidak ada order TP di exchange.
  *
- * Sumber sinyal: /api/snapshot (6 model, sinyal per menit + roiPct untuk aturan gap).
+ * Sumber sinyal: /api/snapshot (6 model, sinyal per menit + roiPct untuk skema profit/gap).
  * Kredensial: BinanceStore (Android Keystore). Tidak ada kunci yang dikirim ke VPS.
  */
 class AutoEngine(private val ctx: Context) {
@@ -49,15 +56,28 @@ class AutoEngine(private val ctx: Context) {
         @Volatile var instance: AutoEngine? = null
 
         private const val SYMBOL = "SOLUSDT"
-        private const val ENTRY_WINDOW_MS = 23L * 60_000
+
+        /** Batas maksimal tunggu 6 model bersinyal (window entry). */
+        private const val ENTRY_WINDOW_MS = 30L * 60_000
+
+        /** Batas maksimal cek model saat patokan tersentuh. */
         private const val RECHECK_MS = 25L * 60_000
-        private const val CORRECTION_MS = 30L * 60_000
-        private const val RETENTION_MS = 5L * 60_000
-        private const val HOLD_MS = 30L * 60_000
+
+        /** Sinyal yang dijawab pada 5 menit terakhir window dibawa ke window berikutnya. */
+        private const val CARRY_MS = 5L * 60_000
         private const val GAP_PCT = 22.0
         private const val BASE_LEVERAGE = 30
         private const val MAX_LEVERAGE = 40
-        private const val MIN_AGREE = 5
+
+        /** Skema 4/6: minimal 4 model selaras arah. */
+        private const val MIN_AGREE = 4
+
+        /** Syarat profit skema 4/6 (ROI bot masing-masing model, bukan total). */
+        private const val ALIGNED_PROFIT_MIN = 48.0
+        private const val MISALIGNED_PROFIT_MAX = -35.0
+
+        /** Minimal model berbalik arah untuk membalik posisi saat recheck gagal. */
+        private const val REVERSAL_MIN = 4
 
         /** SL keras di exchange: -40% ROI (sama dengan batas keluar terakhir). */
         private const val HARD_SL_ROI = 40.0
@@ -77,7 +97,7 @@ class AutoEngine(private val ctx: Context) {
         )
     }
 
-    private enum class Phase { IDLE, BATCH, HOLD_ENTRY, CORRECTION_WAIT, HOLDING, RECHECK }
+    private enum class Phase { IDLE, BATCH, HOLDING, RECHECK }
     private data class Sig(val side: Int, val ts: Long)
     private data class ModelSignal(val name: String, val side: Int)
     private data class BotRoi(val model: String, val roiPct: Double)
@@ -113,8 +133,11 @@ class AutoEngine(private val ctx: Context) {
     private val recheckSigs = LinkedHashMap<String, Sig>()
     /** Waktu snapshot terakhir saat patokan tersentuh; sinyal yang lebih lama tidak dihitung. */
     private var recheckSnapshotAt = 0L
-    /** Berapa kali batch tidak lengkap sudah di-carryover pada siklus entry ini (maks 1). */
-    private var carryCount = 0
+    /**
+     * Timestamp sinyal carry saat window digulirkan. Sinyal dengan `ts <= batchCarryAt`
+     * adalah warisan window sebelumnya, bukan jawaban window berjalan.
+     */
+    private var batchCarryAt = 0L
     private var seeded = false
     private var modelNames: List<String> = DEFAULT_MODELS
 
@@ -126,14 +149,9 @@ class AutoEngine(private val ctx: Context) {
     private var nextLeverage = BASE_LEVERAGE
     private var nextTp = FIRST_TP
     private var nextSl = FIRST_SL
-    private var holdLeverage = BASE_LEVERAGE
-    private var holdTp = FIRST_TP
-    private var holdSl = FIRST_SL
 
     private var recheckStart = 0L
     private var recheckUntil = 0L
-    private var holdUntil = 0L
-    private var neutralUntil = 0L
 
     /**
      * Selama cek 25 menit: posisi Binance TETAP terbuka (masih trading). Yang dinetralkan
@@ -185,7 +203,7 @@ class AutoEngine(private val ctx: Context) {
         log("Auto ON — semua model dinetralkan, mulai mencari pola baru")
         ui {
             BinanceState.autoPhase = "IDLE"
-            BinanceState.autoDetail = "Menunggu pola 5/6"
+            BinanceState.autoDetail = "Menunggu pola 4/6 · window 30 menit"
         }
         neutralizeAllModels("Auto ON")
     }
@@ -352,7 +370,6 @@ class AutoEngine(private val ctx: Context) {
             seeded = true
             return
         }
-        if (phase == Phase.CORRECTION_WAIT) return
 
         for (m in snap.models) {
             current[m.name] = m.side
@@ -362,17 +379,14 @@ class AutoEngine(private val ctx: Context) {
             lastSeen[m.name] = now
             when (phase) {
                 Phase.IDLE, Phase.BATCH -> {
+                    // Window baru selalu dimulai dari sinyal pertama yang masuk.
                     if (batch.isEmpty()) batchStart = now
                     // Sinyal searah yang berulang tetap dianggap aktif (timestamp diperbarui).
                     batch[m.name] = sig
                     if (phase == Phase.IDLE) phase = Phase.BATCH
                 }
-                Phase.HOLD_ENTRY -> {
-                    // Selama masa tahan 30 menit, stance terakhir tiap model tetap diperbarui.
-                    batch[m.name] = sig
-                }
                 Phase.RECHECK -> {
-                    // Kumpulkan sepanjang window 25 menit; arah terakhir yang dipakai menilai.
+                    // Kumpulkan sepanjang window cek; arah terakhir yang dipakai menilai.
                     // Snapshot yang sudah ada sebelum patokan tersentuh tidak dihitung.
                     if (lastSnapshotAt > recheckSnapshotAt) recheckSigs[m.name] = sig
                 }
@@ -390,77 +404,133 @@ class AutoEngine(private val ctx: Context) {
             // RECHECK: posisi TETAP terbuka; hanya menunggu 25 menit lalu menilai model
             Phase.RECHECK -> if (pos == null) onPositionClosedExternally(now) else continueAfterRecheck(pos, now, snap)
             Phase.BATCH -> if (pos != null) adopt(pos) else evaluateBatch(now, snap)
-            Phase.HOLD_ENTRY -> if (pos != null) adopt(pos) else evaluateHold(now, snap)
-            Phase.CORRECTION_WAIT -> {
-                if (pos != null) adopt(pos) else if (now >= neutralUntil) finishCorrection()
-            }
             Phase.IDLE -> if (pos != null) adopt(pos)
         }
         publishAuto()
     }
 
+    /**
+     * Evaluasi window 30 menit. Alur tidak punya fase tunggu terpisah:
+     *  - Semua 6 model sudah menjawab **di window ini** → putuskan sekarang (izin 4/6 atau gagal).
+     *  - Gagal apa pun → sinyal menit 25–30 dibawa sebagai carry, model lain dipaksa netral,
+     *    lalu window 30 menit baru langsung berjalan.
+     *  - Window habis → putuskan dengan data yang ada; kalau tidak lengkap → carry.
+     */
     private suspend fun evaluateBatch(now: Long, snap: SnapshotData) {
         val total = modelNames.size.coerceAtLeast(1)
+        val deadline = batchStart + ENTRY_WINDOW_MS
+        val allResponded = batch.size >= total
+        // Sinyal carry berasal dari window sebelumnya; model harus mengirim sinyal BARU
+        // (ts > batchCarryAt) sebelum dianggap menjawab window ini.
+        val allFresh = allResponded && batch.values.all { it.ts > batchCarryAt }
 
-        // Semua 6 sudah pernah bersinyal -> evaluasi SEKARANG, jangan tunggu 23 menit.
-        if (batch.size >= total) {
-            val longs = batch.values.count { it.side > 0 }
-            val shorts = batch.size - longs
-            val majority = if (longs >= shorts) 1 else -1
-            val agree = max(longs, shorts)
-            if (agree < MIN_AGREE) {
-                startCorrection(now, "sinyal sepakat hanya $agree/$total — koreksi 30 menit")
-                return
-            }
-            tryEnter(majority, now, snap, "entry $agree/$total")
+        if (allFresh) {
+            decideEntry(now, snap, "window 30 menit lengkap")
             return
         }
-
-        val deadline = batchStart + ENTRY_WINDOW_MS
         if (now < deadline) return
+        rollWindow(
+            if (allResponded) "model belum menjawab ulang di window ini"
+            else "hanya ${batch.size}/$total merespon dalam 30 menit",
+        )
+    }
 
-        val responded = batch.size
-        val cutoff = deadline - RETENTION_MS
-        val keep = batch.filterValues { it.ts >= cutoff }
-        if (carryCount == 0 && keep.isNotEmpty()) {
-            carryCount = 1
+    /**
+     * Putuskan izin entry dari sinyal yang terkumpul: **6/6 menjawab**, **≥4 selaras**,
+     * **≥2 model selaras ROI ≥48%**, dan **tiap model tidak selaras ROI ≤−35%**.
+     * Syarat profit yang gagal membatalkan izin 4/6 → tidak entry.
+     */
+    private suspend fun decideEntry(now: Long, snap: SnapshotData, reason: String) {
+        val total = modelNames.size.coerceAtLeast(1)
+        val counts = countSides(batch)
+        val majority = if (counts.longs >= counts.shorts) 1 else -1
+        val agree = max(counts.longs, counts.shorts)
+        if (agree < MIN_AGREE) {
+            rollWindow("sepakat hanya $agree/$total (butuh ≥$MIN_AGREE)")
+            return
+        }
+        val profitFail = profitSchemeFail(batch, majority, snap)
+        if (profitFail != null) {
+            rollWindow("izin 4/6 batal — $profitFail")
+            return
+        }
+        if (roiGapBlocks(majority, snap)) {
+            rollWindow("model ROI tertinggi beda arah (gap ≥ ${GAP_PCT.toInt()}%)")
+            return
+        }
+        doEntry(majority, BASE_LEVERAGE, FIRST_TP, FIRST_SL, now, snap, "$reason · $agree/$total")
+    }
+
+    /**
+     * Skema profit izin 4/6 memakai **ROI bot** tiap model dari /api/snapshot
+     * (keuntungan/kerugian masing-masing model, bukan total gabungan).
+     *
+     * Syarat:
+     *  - setiap model **tidak selaras** harus ROI ≤ −35% (sedang rugi minimal 35%);
+     *  - minimal **2 model selaras** harus ROI ≥ +48%.
+     *
+     * Contoh lolos: selaras (50, 23, 49, −10) + tidak selaras (−37, −40).
+     * Contoh gagal: selaras (50, 100, 32, 21) + tidak selaras (−10, −55) karena −10 > −35.
+     *
+     * @return null kalau lolos, atau alasan gagal kalau ada syarat yang tidak terpenuhi.
+     */
+    private fun profitSchemeFail(
+        sigs: Map<String, Sig>,
+        dir: Int,
+        snap: SnapshotData,
+    ): String? {
+        if (snap.bots.isEmpty()) return "ROI model belum tersedia"
+        val roiOf = snap.bots.associate { it.model to it.roiPct }
+        val aligned = sigs.filterValues { it.side == dir }.keys
+        val misaligned = sigs.filterValues { it.side != dir }.keys
+
+        misaligned.forEach { name ->
+            val roi = roiOf[name] ?: return "ROI $name belum tersedia"
+            if (roi > MISALIGNED_PROFIT_MAX) {
+                return "$name tidak selaras ROI ${roi.toInt()}% (harus ≤ ${MISALIGNED_PROFIT_MAX.toInt()}%)"
+            }
+        }
+        val strong = aligned.count { (roiOf[it] ?: 0.0) >= ALIGNED_PROFIT_MIN }
+        if (strong < 2) return "hanya $strong model selaras ROI ≥${ALIGNED_PROFIT_MIN.toInt()}% (butuh 2)"
+        return null
+    }
+
+    /** Jumlah model yang berbalik arah melawan posisi (untuk aturan reversal saat recheck). */
+    private fun reversalCount(sigs: Map<String, Sig>, dir: Int): Int =
+        sigs.values.count { it.side == -dir }
+
+    /**
+     * Window gagal: bawa sinyal yang dijawab pada **menit 25–30** sebagai carry, paksa
+     * netral model yang menjawab lebih awal (di bawah menit 25), lalu window 30 menit baru
+     * langsung berjalan. Tidak ada jeda kosong.
+     */
+    private suspend fun rollWindow(reason: String) {
+        val keepFrom = batchStart + (ENTRY_WINDOW_MS - CARRY_MS)
+        val keep = batch.filterValues { it.ts >= keepFrom }
+        val dropped = batch.keys - keep.keys
+
+        if (keep.isEmpty()) {
+            log("$reason — netral semua model, window 30 menit baru")
+            neutralizeAllModels("window gagal")
             batch.clear()
-            batch.putAll(keep)
-            batchStart = keep.values.minOf { it.ts }
-            log("entry gagal: $responded/$total merespon — ${keep.size} sinyal dibawa ke batch berikutnya (carryover 1/1)")
+            latest.clear()
+            batchStart = 0
+            batchCarryAt = 0
+            phase = Phase.IDLE
             saveState()
             return
         }
 
-        log("entry gagal: $responded/$total merespon — netral semua, pola baru")
-        neutralizeAllModels("batch tidak lengkap")
-        clearState()
-        phase = Phase.IDLE
-        saveState()
-    }
-
-    /**
-     * Setelah gagal entry karena gap ROI: tunggu 30 menit, lalu nilai ulang memakai
-     * stance TERBARU tiap model (`current`, bukan batch yang dibekukan). Kalau sudah
-     * lengkap, ≥5 selaras, dan tidak ada gap → entry. Kalau belum → netralkan semuanya
-     * dan mulai kumpulkan pola dari awal (persis siklus yang diminta).
-     */
-    private suspend fun evaluateHold(now: Long, snap: SnapshotData) {
-        if (now < holdUntil) return
-        val total = modelNames.size.coerceAtLeast(1)
-        val responded = batch.size
-        val longs = batch.values.count { it.side > 0 }
-        val shorts = batch.size - longs
-        val majority = if (longs >= shorts) 1 else -1
-        val agree = max(longs, shorts)
-        if (responded >= total && agree >= MIN_AGREE && !roiGapBlocks(majority, snap)) {
-            doEntry(majority, holdLeverage, holdTp, holdSl, now, snap, "entry setelah tahan 30 menit")
-            return
-        }
-        log("masa tahan habis (${responded}/$total respon, $agree selaras, gap masih ada) — netral semua, pola baru")
-        neutralizeAllModels("masa tahan habis")
-        clearState()
-        phase = Phase.IDLE
+        batch.clear()
+        batch.putAll(keep)
+        batchStart = keep.values.minOf { it.ts }
+        batchCarryAt = batchStart
+        phase = Phase.BATCH
+        if (dropped.isNotEmpty()) neutralizeModels(dropped.toList(), reason)
+        log(
+            "$reason — ${keep.size} sinyal menit 25–30 dibawa, " +
+                "${dropped.size} model dinetralkan, window 30 menit baru",
+        )
         saveState()
     }
 
@@ -468,11 +538,12 @@ class AutoEngine(private val ctx: Context) {
      * Dipanggil tiap loop selama fase RECHECK (posisi masih terbuka & masih trading).
      *
      * - SL keras -40% tetap dipasang/dipelihara di exchange.
-     * - Patokan berikutnya BELUM berlaku sampai 25 menit selesai (posisi dibiarkan
-     *   berjalan mencari keuntungan lebih).
-     * - Setelah 25 menit: kalau keenam model merespon, ≥5 selaras arah posisi, dan tidak
-     *   ada gap ROI ≥22% (model teratas tidak berbalik arah) → LANJUT: naikkan leverage
-     *   dan pasang patokan berikutnya. Kalau tidak → keluar sekarang.
+     * - Patokan berikutnya BELUM berlaku sampai cek 25 menit selesai.
+     * - Begitu 6/6 model sudah bersinyal → langsung dinilai (skema 4/6 + syarat profit):
+     *   - lolos → LANJUT (leverage naik, level berikutnya);
+     *   - **≥4 model berbalik arah** → tutup posisi lama, buka order arah berbalik (30x, level fresh);
+     *   - gagal lainnya → keluar total, netral semua, mulai window 30 menit baru.
+     * - Sampai batas 25 menit model tidak lengkap → keluar + netral + window baru.
      */
     private suspend fun continueAfterRecheck(pos: BinancePosition, now: Long, snap: SnapshotData) {
         if (entryPrice <= 0 && pos.entryPrice > 0) entryPrice = pos.entryPrice
@@ -493,21 +564,30 @@ class AutoEngine(private val ctx: Context) {
         val total = modelNames.size.coerceAtLeast(1)
         val responded = recheckSigs.size
         if (responded < total) {
-            // Belum 6/6: tunggu sampai batas 25 menit, lalu out.
             if (now < recheckUntil) return
             exitAfterRecheck("cek 25 menit gagal: hanya $responded/$total merespon", now)
             return
         }
 
-        // 6/6 sudah pernah bersinyal -> langsung nilai (tidak menunggu sisa window).
-        // Arah tiap model = sinyal terakhirnya; yang tidak pernah bersinyal menggagalkan cek.
+        // 6/6 sudah bersinyal → langsung nilai. Arah tiap model = sinyal terakhirnya.
+        val reversed = reversalCount(recheckSigs, direction)
+        if (reversed >= REVERSAL_MIN) {
+            reversePosition(reversed, total, now, snap)
+            return
+        }
+
         val aligned = recheckSigs.values.count { it.side == direction }
         if (aligned < MIN_AGREE) {
-            exitAfterRecheck("cek model: hanya $aligned/$total selaras arah posisi", now)
+            exitAfterRecheck("cek model: hanya $aligned/$total selaras (butuh ≥$MIN_AGREE)", now)
+            return
+        }
+        val profitFail = profitSchemeFail(recheckSigs, direction, snap)
+        if (profitFail != null) {
+            exitAfterRecheck("cek model: izin 4/6 batal — $profitFail", now)
             return
         }
         if (roiGapBlocks(direction, snap)) {
-            exitAfterRecheck("cek model: model ROI tertinggi berbalik arah (gap ≥ 22%)", now)
+            exitAfterRecheck("cek model: model ROI tertinggi berbalik arah (gap ≥ ${GAP_PCT.toInt()}%)", now)
             return
         }
 
@@ -534,11 +614,51 @@ class AutoEngine(private val ctx: Context) {
         recheckSigs.clear()
         val dirText = if (direction > 0) "LONG" else "SHORT"
         log(
-            "$dirText lanjut (${aligned}/${total} selaras) · leverage ${leverage}x · " +
+            "$dirText lanjut (${aligned}/$total selaras, skema 4/6 lolos) · leverage ${leverage}x · " +
                 "patokan berikut +${tpLevel.toInt()}% / -${slLevel.toInt()}%",
         )
         notify("$dirText lanjut ${leverage}x. Patokan +${tpLevel.toInt()}% / -${slLevel.toInt()}%.")
         saveState()
+    }
+
+    /**
+     * Recheck gagal dan mayoritas model berbalik arah: jual posisi lama lalu langsung buka
+     * order baru di arah berbalik dengan leverage 30x dan level patokan fresh (+22/-22).
+     */
+    private suspend fun reversePosition(reversed: Int, total: Int, now: Long, snap: SnapshotData) {
+        val newDir = -direction
+        val dirText = if (newDir > 0) "LONG" else "SHORT"
+        log("cek model: $reversed/$total berbalik arah — tutup posisi lama, buka $dirText 30x")
+        notify("Model berbalik arah $reversed/$total. Tutup posisi, buka $dirText.")
+        busy(true)
+        try {
+            closeIfOpen(api)
+        } finally {
+            busy(false)
+        }
+        waitFlat()
+        neutralizeAllModels("berbalik arah")
+        clearState()
+        phase = Phase.IDLE
+        saveState()
+        doEntry(newDir, BASE_LEVERAGE, FIRST_TP, FIRST_SL, now, snap, "reversal $reversed/$total", force = true)
+    }
+
+    /** Tunggu posisi benar-benar flat sebelum order arah baru dikirim. */
+    private suspend fun waitFlat() {
+        val client = api ?: return
+        val until = System.currentTimeMillis() + 10_000
+        while (System.currentTimeMillis() < until) {
+            delay(500)
+            val acc = try {
+                client.account()
+            } catch (_: Exception) {
+                null
+            } ?: continue
+            lastAccount = acc
+            publishAccount(acc)
+            if (acc.positions.none { it.symbol == SYMBOL }) return
+        }
     }
 
     /** Gagal cek 25 menit: tutup posisi sekarang, netralkan semua model, mulai lagi. */
@@ -571,23 +691,44 @@ class AutoEngine(private val ctx: Context) {
         }
     }
 
-    private suspend fun tryEnter(dir: Int, now: Long, snap: SnapshotData, reason: String) {
-        if (roiGapBlocks(dir, snap)) {
-            phase = Phase.HOLD_ENTRY
-            holdUntil = now + HOLD_MS
-            holdLeverage = nextLeverage
-            holdTp = nextTp
-            holdSl = nextSl
-            log("tahan entry: model ROI tertinggi beda arah, gap ≥ 22% — tunggu 30 menit")
-            saveState()
-            return
+    private data class SideCount(val longs: Int, val shorts: Int)
+
+    private fun countSides(sigs: Map<String, Sig>): SideCount {
+        val longs = sigs.values.count { it.side > 0 }
+        return SideCount(longs, sigs.size - longs)
+    }
+
+    /**
+     * Paksa netral model tertentu saja (yang tidak membawa carry). Dipakai saat window
+     * gagal supaya model yang jawab di bawah menit 25 dikembalikan ke netral, sementara
+     * sinyal menit 25–30 tetap dipakai di window berikutnya.
+     */
+    private fun neutralizeModels(models: List<String>, reason: String) {
+        if (models.isEmpty()) return
+        scope.launch {
+            for (name in models) {
+                try {
+                    val body = JSONObject().put("id", name).toString()
+                        .toRequestBody("application/json".toMediaType())
+                    val req = Request.Builder()
+                        .url("${Prefs.baseUrl(ctx)}/api/bots/neutral")
+                        .post(body)
+                        .header("cache-control", "no-store")
+                        .build()
+                    http.newCall(req).execute().use { resp ->
+                        if (!resp.isSuccessful) log("netral $name gagal: HTTP ${resp.code}")
+                    }
+                } catch (e: Exception) {
+                    log("netral $name gagal: ${e.message}")
+                }
+            }
+            log("server ($reason): ${models.size} model dipaksa netral")
         }
-        doEntry(dir, nextLeverage, nextTp, nextSl, now, snap, reason)
     }
 
     /**
      * Aturan NOTE: kalau model dengan ROI tertinggi berbeda arah dari mayoritas dan
-     * jarak ROI-nya ke peringkat kedua ≥ 22 poin, tahan entry (jangan lawan model itu).
+     * jarak ROI-nya ke peringkat kedua ≥ 22 poin, jangan ikut entry / langsung keluar.
      */
     private fun roiGapBlocks(dir: Int, snap: SnapshotData): Boolean {
         if (snap.bots.size < 2) return false
@@ -617,8 +758,9 @@ class AutoEngine(private val ctx: Context) {
         now: Long,
         snap: SnapshotData,
         reason: String,
+        force: Boolean = false,
     ) {
-        if (BinanceState.busy) return
+        if (!force && BinanceState.busy) return
         val client = api ?: return
         val account = lastAccount ?: return
         if (account.positions.any { it.symbol == SYMBOL }) {
@@ -685,7 +827,6 @@ class AutoEngine(private val ctx: Context) {
             batch.clear()
             latest.clear()
             recheckSigs.clear()
-            carryCount = 0
             seeded = true
             lastProtectCheck = now
 
@@ -779,9 +920,10 @@ class AutoEngine(private val ctx: Context) {
     }
 
     /**
-     * Patokan tersentuh → MULAI cek 25 menit. Posisi TIDAK ditutup.
-     * Keenam model dinetralkan supaya bisa mencari pola baru; 25 menit kemudian kita
-     * lihat apakah mereka masih searah posisi (lanjut) atau berbalik arah (keluar).
+     * Patokan tersentuh → MULAI cek maksimal 25 menit. Posisi TIDAK ditutup.
+     * Keenam model dinetralkan supaya bisa mencari pola baru; begitu semuanya menjawab,
+     * hasilnya dinilai: lanjut (skema 4/6 lolos), berbalik arah (≥4 lawan arah → reversal),
+     * atau keluar.
      */
     private suspend fun startRecheck(kind: String, roi: Double, now: Long) {
         val dirText = if (direction > 0) "LONG" else "SHORT"
@@ -810,7 +952,6 @@ class AutoEngine(private val ctx: Context) {
         recheckUntil = now + RECHECK_MS
         recheckSigs.clear()
         recheckSnapshotAt = lastSnapshotAt
-        carryCount = 0
 
         // siapkan tangga berikutnya (dipakai hanya kalau lolos cek 25 menit)
         if (kind == "TP") {
@@ -861,7 +1002,6 @@ class AutoEngine(private val ctx: Context) {
         lastRoi = if (entryPrice > 0 && mark > 0) direction * (mark / entryPrice - 1) * leverage * 100 else 0.0
         phase = Phase.HOLDING
         recheckSigs.clear()
-        carryCount = 0
         log("posisi lama diadopsi ${if (direction > 0) "LONG" else "SHORT"} @ ${priceText(entryPrice)} · ROI ${lastRoi.toInt()}%")
         val client = api
         if (client != null && entryPrice > 0) {
@@ -1036,45 +1176,14 @@ class AutoEngine(private val ctx: Context) {
 
     // ---------------------------------------------------------------- state
 
-    /**
-     * Semua model sudah merespon tapi sepakat <5/6: beri 30 menit untuk saling koreksi
-     * (model TIDAK dinetralkan dulu), setelah itu baru netral semua dan mulai pola baru.
-     */
-    private fun startCorrection(now: Long, msg: String) {
-        log(msg)
-        phase = Phase.CORRECTION_WAIT
-        neutralUntil = now + CORRECTION_MS
-        batch.clear()
-        latest.clear()
-        recheckSigs.clear()
-        batchStart = 0
-        carryCount = 0
-        saveState()
-        ui {
-            BinanceState.autoPhase = "CORRECTION_WAIT"
-            BinanceState.autoDetail = "Koreksi model ${mmss(neutralUntil - now)}"
-        }
-    }
-
-    /** 30 menit koreksi selesai: netralkan semua model lalu mulai pola baru. */
-    private fun finishCorrection() {
-        log("koreksi 30 menit selesai — netral semua, pola baru")
-        neutralizeAllModels("koreksi 30 menit selesai")
-        clearState()
-        phase = Phase.IDLE
-        saveState()
-    }
-
     private fun clearState() {
         batch.clear()
         latest.clear()
         current.clear()
         lastSeen.clear()
         recheckSigs.clear()
-        carryCount = 0
         batchStart = 0
-        holdUntil = 0
-        neutralUntil = 0
+        batchCarryAt = 0
         recheckStart = 0
         recheckUntil = 0
         recheckKind = ""
@@ -1088,9 +1197,6 @@ class AutoEngine(private val ctx: Context) {
         nextLeverage = BASE_LEVERAGE
         nextTp = FIRST_TP
         nextSl = FIRST_SL
-        holdLeverage = BASE_LEVERAGE
-        holdTp = FIRST_TP
-        holdSl = FIRST_SL
         seeded = true
     }
 
@@ -1115,19 +1221,11 @@ class AutoEngine(private val ctx: Context) {
         var aligned = 0
         val detail = when (phase) {
             Phase.BATCH -> {
+                val counts = countSides(batch)
                 responded = batch.size
-                val longs = batch.values.count { it.side > 0 }
-                aligned = max(longs, batch.size - longs)
+                aligned = max(counts.longs, counts.shorts)
                 "Sinyal $responded/$total · sisa ${mmss(batchStart + ENTRY_WINDOW_MS - now)}"
             }
-            Phase.HOLD_ENTRY -> {
-                responded = batch.size
-                val longs = batch.values.count { it.side > 0 }
-                aligned = max(longs, batch.size - longs)
-                "Tahan entry (gap ROI) · netral dalam ${mmss(holdUntil - now)}"
-            }
-            Phase.CORRECTION_WAIT ->
-                "Koreksi model (model bebas koreksi) · pola baru ${mmss(neutralUntil - now)}"
             Phase.HOLDING -> {
                 responded = modelNames.count { (current[it] ?: 0) != 0 }
                 aligned = modelNames.count { current[it] == direction }
@@ -1136,10 +1234,12 @@ class AutoEngine(private val ctx: Context) {
             Phase.RECHECK -> {
                 responded = recheckSigs.size
                 aligned = recheckSigs.values.count { it.side == direction }
+                val reversed = reversalCount(recheckSigs, direction)
                 val hit = if (recheckKind == "TP") "+${tpLevel.toInt()}%" else "-${slLevel.toInt()}%"
-                "Posisi MASIH JALAN ${leverage}x · ROI ${lastRoi.toInt()}% · model $responded/$total · cek $hit sisa ${mmss(recheckUntil - now)}"
+                "Posisi MASIH JALAN ${leverage}x · ROI ${lastRoi.toInt()}% · model $responded/$total · " +
+                    "balik $reversed · cek $hit sisa ${mmss(recheckUntil - now)}"
             }
-            Phase.IDLE -> "Menunggu pola 5/6 · $total model"
+            Phase.IDLE -> "Menunggu pola 4/6 · $total model"
         }
         ui {
             BinanceState.autoPhase = phase.name
@@ -1164,6 +1264,7 @@ class AutoEngine(private val ctx: Context) {
             val o = JSONObject()
             o.put("phase", phase.name)
             o.put("batchStart", batchStart)
+            o.put("batchCarryAt", batchCarryAt)
             o.put("seeded", seeded)
             o.put("direction", direction)
             o.put("leverage", leverage)
@@ -1172,21 +1273,15 @@ class AutoEngine(private val ctx: Context) {
             o.put("nextLeverage", nextLeverage)
             o.put("nextTp", nextTp)
             o.put("nextSl", nextSl)
-            o.put("holdLeverage", holdLeverage)
-            o.put("holdTp", holdTp)
-            o.put("holdSl", holdSl)
             o.put("recheckStart", recheckStart)
             o.put("recheckUntil", recheckUntil)
             o.put("recheckKind", recheckKind)
-            o.put("holdUntil", holdUntil)
-            o.put("neutralUntil", neutralUntil)
             o.put("entryPrice", entryPrice)
             o.put("hardSlPrice", hardSlPrice)
             o.put("lastRoi", lastRoi)
             o.put("batch", sigMapToJson(batch))
             o.put("latest", sigMapToJson(latest))
             o.put("recheckSigs", sigMapToJson(recheckSigs))
-            o.put("carryCount", carryCount)
             val seen = JSONObject()
             for ((k, v) in lastSeen) seen.put(k, v)
             o.put("lastSeen", seen)
@@ -1202,13 +1297,11 @@ class AutoEngine(private val ctx: Context) {
         try {
             val o = JSONObject(raw)
             val savedPhase = o.optString("phase", "IDLE")
-            // State lama memakai NEUTRAL_WAIT; sekarang artinya koreksi 30 menit.
-            phase = if (savedPhase == "NEUTRAL_WAIT") {
-                Phase.CORRECTION_WAIT
-            } else {
-                runCatching { Phase.valueOf(savedPhase) }.getOrDefault(Phase.IDLE)
-            }
+            // Fase lama (NEUTRAL_WAIT / CORRECTION_WAIT / HOLD_ENTRY) sudah tidak ada:
+            // kembali ke IDLE supaya window 30 menit baru dimulai bersih.
+            phase = runCatching { Phase.valueOf(savedPhase) }.getOrDefault(Phase.IDLE)
             batchStart = o.optLong("batchStart", 0)
+            batchCarryAt = o.optLong("batchCarryAt", 0)
             seeded = o.optBoolean("seeded", false)
             direction = o.optInt("direction", 0)
             leverage = o.optInt("leverage", BASE_LEVERAGE)
@@ -1217,21 +1310,15 @@ class AutoEngine(private val ctx: Context) {
             nextLeverage = o.optInt("nextLeverage", BASE_LEVERAGE)
             nextTp = o.optDouble("nextTp", FIRST_TP)
             nextSl = o.optDouble("nextSl", FIRST_SL)
-            holdLeverage = o.optInt("holdLeverage", nextLeverage)
-            holdTp = o.optDouble("holdTp", nextTp)
-            holdSl = o.optDouble("holdSl", nextSl)
             recheckStart = o.optLong("recheckStart", 0)
             recheckUntil = o.optLong("recheckUntil", 0)
             recheckKind = o.optString("recheckKind", "")
-            holdUntil = o.optLong("holdUntil", 0)
-            neutralUntil = o.optLong("neutralUntil", 0)
             entryPrice = o.optDouble("entryPrice", 0.0)
             hardSlPrice = o.optDouble("hardSlPrice", 0.0)
             lastRoi = o.optDouble("lastRoi", 0.0)
             readSigMap(o.optJSONObject("batch"), batch)
             readSigMap(o.optJSONObject("latest"), latest)
             readSigMap(o.optJSONObject("recheckSigs"), recheckSigs)
-            carryCount = o.optInt("carryCount", 0)
             val seen = o.optJSONObject("lastSeen") ?: JSONObject()
             for (k in seen.keys()) lastSeen[k] = seen.optLong(k, 0)
         } catch (_: Exception) {

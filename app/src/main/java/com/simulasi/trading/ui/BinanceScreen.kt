@@ -514,10 +514,13 @@ fun BinanceScreen(modifier: Modifier = Modifier) {
             }
             Spacer(Modifier.height(6.dp))
             Text(
-                "Aturan: 6/6 merespon + ≥5 sepakat → entry langsung 30x (maks 23 menit). Level kena: posisi " +
-                    "tetap jalan, 6 model netral; begitu 6/6 bersinyal langsung dinilai (≥5 selaras = lanjut, " +
-                    "gagal atau 25 menit = out). Level +22/+34/+50 lalu +15; -22/-31; -40 = out. Exchange hanya " +
-                    "SL keras -40%. Gap ROI ≥22% (ROI teratas positif) menahan entry 30 menit lalu netral.",
+                "Aturan: window 30 menit untuk 6 model bersinyal. Entry/lanjut butuh 6/6 menjawab, ≥4 " +
+                    "selaras, ≥2 selaras ROI ≥48%, dan tiap model tidak selaras ROI ≤-35% (rugi minimal 35%, " +
+                    "dihitung per model). Kurang satu = izin 4/6 batal. Window gagal: sinyal menit 25–30 " +
+                    "dibawa, sisanya dinetralkan, window baru langsung jalan tanpa jeda. Level kena: posisi " +
+                    "tetap jalan, cek 25 menit; ≥4 berbalik arah = tutup lalu buka arah baru 30x. Level " +
+                    "+22/+34/+50 lalu +15; -22/-31; -40 = out total. Exchange hanya SL keras -40%. " +
+                    "Gap ROI ≥22% tetap menahan entry / menggagalkan cek.",
                 fontSize = 9.sp,
                 color = CMute,
             )
@@ -631,11 +634,9 @@ private fun RowScopeSpacer() {
 
 private fun phaseLabel(phase: String): String = when (phase) {
     "IDLE" -> "Mencari pola"
-    "BATCH" -> "Mengumpulkan sinyal"
-    "HOLD_ENTRY" -> "Tahan entry"
-    "NEUTRAL_WAIT", "CORRECTION_WAIT" -> "Koreksi model / tunggu pola"
+    "BATCH" -> "Mengumpulkan sinyal (30 menit)"
     "HOLDING" -> "Posisi terbuka"
-    "RECHECK" -> "Cek ulang model"
+    "RECHECK" -> "Cek ulang model (25 menit)"
     else -> "Auto off"
 }
 
