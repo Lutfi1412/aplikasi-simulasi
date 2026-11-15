@@ -33,6 +33,7 @@ object BinanceStore {
     private const val K_AUTO_ON = "auto_enabled"
     private const val K_SIZING = "sizing_override"
     private const val K_STATE = "auto_state"
+    private const val K_AUTO_CFG = "auto_config"
 
     private fun sp(c: Context) =
         c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -95,6 +96,13 @@ object BinanceStore {
     fun autoState(c: Context): String? = sp(c).getString(K_STATE, null)
     fun setAutoState(c: Context, value: String) =
         sp(c).edit().putString(K_STATE, value).apply()
+
+    /** Skema Auto yang diatur dari aplikasi; engine membacanya tiap loop. */
+    fun autoConfig(c: Context): AutoConfig =
+        AutoConfig.fromJson(sp(c).getString(K_AUTO_CFG, null))
+
+    fun setAutoConfig(c: Context, value: AutoConfig) =
+        sp(c).edit().putString(K_AUTO_CFG, value.sanitized().toJson()).apply()
 
     private fun key(): SecretKey {
         val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }

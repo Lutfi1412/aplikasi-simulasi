@@ -80,6 +80,8 @@ fun BinanceScreen(modifier: Modifier = Modifier) {
     var secret by remember { mutableStateOf("") }
     var comment by remember { mutableStateOf("") }
     var showSecret by remember { mutableStateOf(false) }
+    var showConfig by remember { mutableStateOf(false) }
+    var cfgVersion by remember { mutableStateOf(0) }
 
     var margin by remember { mutableStateOf("10") }
     var lev by remember { mutableFloatStateOf(30f) }
@@ -476,6 +478,25 @@ fun BinanceScreen(modifier: Modifier = Modifier) {
                 )
             }
             Spacer(Modifier.height(8.dp))
+            val cfg = remember(cfgVersion) { BinanceStore.autoConfig(ctx) }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Skema Auto", color = CText, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "window ${cfg.entryWindowMin}m · ≥${cfg.minAgree}/6 · " +
+                            "lev ${cfg.leverageLadder.joinToString("→")} · " +
+                            "TP ${cfg.tpLadder.joinToString("→") { it.toInt().toString() }}% · " +
+                            "SL ${cfg.slLadder.joinToString("→") { it.toInt().toString() }}%",
+                        color = CMute,
+                        fontSize = 8.sp,
+                        lineHeight = 11.sp,
+                    )
+                }
+                TextButton(onClick = { showConfig = true }) {
+                    Text("Atur skema", fontSize = 10.sp, color = CCyan)
+                }
+            }
+            Spacer(Modifier.height(8.dp))
             var sizing by remember { mutableStateOf(BinanceStore.sizingOverride(ctx)) }
             OutlinedTextField(
                 value = sizing,
@@ -514,19 +535,31 @@ fun BinanceScreen(modifier: Modifier = Modifier) {
             }
             Spacer(Modifier.height(6.dp))
             Text(
-                "Aturan: window 30 menit untuk 6 model bersinyal. Entry/lanjut butuh 6/6 menjawab, ≥4 " +
-                    "selaras, ≥2 selaras ROI ≥48%, dan tiap model tidak selaras ROI ≤-35% (rugi minimal 35%, " +
-                    "dihitung per model). Kurang satu = izin 4/6 batal. Window gagal: sinyal menit 25–30 " +
-                    "dibawa, sisanya dinetralkan, window baru langsung jalan tanpa jeda. Level kena: posisi " +
-                    "tetap jalan, cek 25 menit; ≥4 berbalik arah = tutup lalu buka arah baru 30x. Level " +
-                    "+22/+34/+50 lalu +15; -22/-31; -40 = out total. Exchange hanya SL keras -40%. " +
-                    "Gap ROI ≥22% tetap menahan entry / menggagalkan cek.",
+                "Semua angka di atas diatur di tombol \"Atur skema\": window & carry, minimal model " +
+                    "menjawab/selaras, syarat profit per model (≥48% / ≤-35%), gap ROI, reversal, " +
+                    "tangga leverage, tangga TP, dan tangga SL. Nilai terakhir tangga SL = SL keras di " +
+                    "exchange. Aksi saat gagal juga bisa dipilih (carry / reset / cooldown / hold).",
                 fontSize = 9.sp,
                 color = CMute,
             )
         }
 
         Spacer(Modifier.height(16.dp))
+    }
+
+    if (showConfig) {
+        val current = BinanceStore.autoConfig(ctx)
+        AutoConfigDialog(
+            initial = current,
+            onDismiss = { showConfig = false },
+            onSave = { updated ->
+                BinanceStore.setAutoConfig(ctx, updated)
+                cfgVersion++
+                showConfig = false
+                notice = "Skema Auto disimpan — berlaku di loop berikutnya"
+                AutoEngine.instance?.onConfigChanged()
+            },
+        )
     }
 
     if (confirmDelete) {
