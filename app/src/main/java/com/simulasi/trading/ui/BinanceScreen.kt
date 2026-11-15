@@ -483,17 +483,18 @@ fun BinanceScreen(modifier: Modifier = Modifier) {
                 Column(Modifier.weight(1f)) {
                     Text("Skema Auto", color = CText, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                     Text(
-                        "window ${cfg.entryWindowMin}m · ≥${cfg.minAgree}/6 · " +
-                            "lev ${cfg.leverageLadder.joinToString("→")} · " +
-                            "TP ${cfg.tpLadder.joinToString("→") { it.toInt().toString() }}% · " +
-                            "SL ${cfg.slLadder.joinToString("→") { it.toInt().toString() }}%",
+                        "window ${cfg.entryWindowMin}m · lev ${cfg.leverageLadder.joinToString("→")} · " +
+                            "TP ${cfg.tpLadder.joinToString("→") { it.toInt().toString() }}%" +
+                            (if (cfg.tpExtend) "+" else "") + " · " +
+                            "SL ${cfg.slLadder.joinToString("→") { it.toInt().toString() }}% · " +
+                            "skema ${cfg.entrySchemes.count { it.enabled }}/${cfg.entrySchemes.size}",
                         color = CMute,
                         fontSize = 8.sp,
                         lineHeight = 11.sp,
                     )
                 }
                 TextButton(onClick = { showConfig = true }) {
-                    Text("Atur skema", fontSize = 10.sp, color = CCyan)
+                    Text("Atur", fontSize = 10.sp, color = CCyan)
                 }
             }
             Spacer(Modifier.height(8.dp))

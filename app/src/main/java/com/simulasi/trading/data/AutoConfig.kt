@@ -4,117 +4,87 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Skema Auto yang bisa diubah sepenuhnya dari aplikasi (tab Binance → "Skema Auto").
+ * Satu aturan skema (dipakai untuk skema Entry maupun skema Recheck).
  *
- * Semua nilai default = perilaku #28, jadi tanpa diubah Auto tetap seperti sebelumnya.
- * Engine membaca objek ini setiap loop, jadi simpan → berlaku tanpa restart.
+ * Skema hanya berisi **syarat**; waktu, tangga leverage/TP/SL, dan aksi saat gagal ada di
+ * [AutoCommon] karena berlaku untuk semua skema.
  *
- * Tangga (ladder) bisa diisi berapa pun:
- *  - [leverageLadder] leverage entry pertama … leverage setelah lolos cek berikutnya.
- *  - [tpLadder] level TP berurutan (ROI %).
- *  - [slLadder] level SL berurutan; **elemen terakhir = SL keras** yang menempel di exchange.
+ * Banyak skema dengan logika **OR**: kalau ada minimal satu skema aktif yang cocok, ACC.
  */
-data class AutoConfig(
-    // ---- waktu
-    val entryWindowMin: Int = 30,
-    val carryMin: Int = 5,
-    val recheckMin: Int = 25,
+data class SchemeRule(
+    val id: String,
+    val name: String,
+    val enabled: Boolean = true,
 
-    // ---- izin entry / lanjut
-    /** minimal model yang harus selaras arah. */
-    val minAgree: Int = 4,
+    // ---- responden
     /** wajib semua model memberi sinyal di window. */
     val requireAllModels: Boolean = true,
-    /** dipakai kalau [requireAllModels] mati: minimal model yang menjawab. */
+    /** dipakai kalau [requireAllModels] mati. */
     val minResponded: Int = 6,
+
+    // ---- selaras
+    /** minimal model yang harus selaras arah. */
+    val minAgree: Int = 4,
 
     // ---- syarat profit (ROI bot per model)
     val profitRuleEnabled: Boolean = true,
-    /** minimal ROI untuk model yang selaras. */
     val alignedMinRoi: Double = 48.0,
-    /** berapa model selaras yang wajib mencapai [alignedMinRoi]. */
     val alignedMinCount: Int = 2,
-    /** batas ROI tertinggi untuk model yang tidak selaras (harus ≤ nilai ini). */
     val misalignedMaxRoi: Double = -35.0,
-    /** model yang belum bersinyal tapi ROI-nya tinggi ikut memblokir. */
+
+    // ---- model belum bersinyal tapi untung besar
     val silentProfitBlockEnabled: Boolean = false,
     val silentProfitMax: Double = 50.0,
 
-    // ---- aturan gap ROI 1-vs-sisanya
+    // ---- gap ROI 1 vs sisanya
     val gapRuleEnabled: Boolean = true,
     val gapPct: Double = 22.0,
-    /** gap hanya berlaku kalau ROI model teratas positif. */
     val gapOnlyIfTopPositive: Boolean = true,
-
-    // ---- berbalik arah
-    val reversalEnabled: Boolean = true,
-    val reversalMin: Int = 4,
-
-    // ---- tangga leverage / TP / SL
-    val leverageLadder: List<Int> = listOf(30, 35, 40),
-    /** kenaikan leverage kalau tangga sudah habis (dibatasi [maxLeverage]). */
-    val leverageStep: Int = 5,
-    val maxLeverage: Int = 40,
-    val tpLadder: List<Double> = listOf(22.0, 34.0, 50.0, 65.0),
-    /** kenaikan TP kalau tangga sudah habis. */
-    val tpStep: Double = 15.0,
-    val slLadder: List<Double> = listOf(22.0, 31.0, 40.0),
-
-    // ---- aksi saat skema gagal
-    /** CARRY = bawa sinyal carry; RESET = netral semua; COOLDOWN = netral + jeda. */
-    val entryFailAction: String = "CARRY",
-    val entryFailCooldownMin: Int = 30,
-    /** OUT = tutup posisi; HOLD = pertahankan posisi dan cek ulang sekali lagi. */
-    val recheckFailAction: String = "OUT",
 ) {
-    /** SL keras di exchange = level SL terbesar. */
-    val hardSlRoi: Double get() = slLadder.maxOrNull() ?: 40.0
-    /** Leverage entry pertama. */
-    val entryLeverage: Int get() = leverageLadder.minOrNull() ?: 30
-    /** Level TP pertama. */
-    val entryTp: Double get() = tpLadder.minOrNull() ?: 22.0
-    /** Level SL pertama. */
-    val entrySl: Double get() = slLadder.minOrNull() ?: 22.0
+    fun sanitized(): SchemeRule = copy(
+        minResponded = minResponded.coerceIn(1, 6),
+        minAgree = minAgree.coerceIn(1, 6),
+        alignedMinRoi = alignedMinRoi.coerceIn(-100.0, 1000.0),
+        alignedMinCount = alignedMinCount.coerceIn(1, 6),
+        misalignedMaxRoi = misalignedMaxRoi.coerceIn(-100.0, 500.0),
+        silentProfitMax = silentProfitMax.coerceIn(-100.0, 1000.0),
+        gapPct = gapPct.coerceIn(0.0, 500.0),
+        name = name.trim().ifBlank { "Skema" },
+    )
 
-    fun sanitized(): AutoConfig {
-        val levs = leverageLadder.filter { it in 1..125 }.distinct().sorted().ifEmpty { listOf(30) }
-        val tps = tpLadder.filter { it > 0.0 && it <= 2000.0 }.distinct().sorted().ifEmpty { listOf(22.0) }
-        val sls = slLadder.filter { it > 0.0 && it <= 100.0 }.distinct().sorted().ifEmpty { listOf(40.0) }
-        return copy(
-            entryWindowMin = entryWindowMin.coerceIn(5, 240),
-            carryMin = carryMin.coerceIn(0, 240),
-            recheckMin = recheckMin.coerceIn(5, 240),
-            minAgree = minAgree.coerceIn(1, 6),
-            minResponded = minResponded.coerceIn(1, 6),
-            alignedMinRoi = alignedMinRoi.coerceIn(-100.0, 1000.0),
-            alignedMinCount = alignedMinCount.coerceIn(1, 6),
-            misalignedMaxRoi = misalignedMaxRoi.coerceIn(-100.0, 500.0),
-            silentProfitMax = silentProfitMax.coerceIn(-100.0, 1000.0),
-            gapPct = gapPct.coerceIn(0.0, 500.0),
-            reversalMin = reversalMin.coerceIn(1, 6),
-            leverageLadder = levs,
-            maxLeverage = maxLeverage.coerceIn(levs.last(), 125),
-            leverageStep = leverageStep.coerceIn(1, 50),
-            tpLadder = tps,
-            tpStep = tpStep.coerceIn(1.0, 500.0),
-            slLadder = sls,
-            entryFailCooldownMin = entryFailCooldownMin.coerceIn(0, 240),
-            entryFailAction = entryFailAction.uppercase().let {
-                if (it in setOf("CARRY", "RESET", "COOLDOWN")) it else "CARRY"
-            },
-            recheckFailAction = recheckFailAction.uppercase().let {
-                if (it in setOf("OUT", "HOLD")) it else "OUT"
-            },
-        )
+    /** Ringkasan satu baris untuk daftar skema. */
+    fun summary(): String = buildString {
+        append(if (requireAllModels) "6/6" else "≥$minResponded")
+        append(" jawab · ≥")
+        append(minAgree)
+        append("/6 selaras")
+        if (profitRuleEnabled) {
+            append(" · ")
+            append(alignedMinCount)
+            append(" ≥")
+            append(alignedMinRoi.toInt())
+            append("% · lawan ≤")
+            append(misalignedMaxRoi.toInt())
+            append("%")
+        }
+        if (gapRuleEnabled) {
+            append(" · gap ≥")
+            append(gapPct.toInt())
+        }
+        if (silentProfitBlockEnabled) {
+            append(" · blokir diam >")
+            append(silentProfitMax.toInt())
+            append("%")
+        }
     }
 
-    fun toJson(): String = JSONObject().apply {
-        put("entryWindowMin", entryWindowMin)
-        put("carryMin", carryMin)
-        put("recheckMin", recheckMin)
-        put("minAgree", minAgree)
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("id", id)
+        put("name", name)
+        put("enabled", enabled)
         put("requireAllModels", requireAllModels)
         put("minResponded", minResponded)
+        put("minAgree", minAgree)
         put("profitRuleEnabled", profitRuleEnabled)
         put("alignedMinRoi", alignedMinRoi)
         put("alignedMinCount", alignedMinCount)
@@ -124,43 +94,184 @@ data class AutoConfig(
         put("gapRuleEnabled", gapRuleEnabled)
         put("gapPct", gapPct)
         put("gapOnlyIfTopPositive", gapOnlyIfTopPositive)
-        put("reversalEnabled", reversalEnabled)
-        put("reversalMin", reversalMin)
+    }
+
+    companion object {
+        val ENTRY_DEFAULT = SchemeRule(id = "entry-1", name = "Entry standar", minAgree = 4)
+        val RECHECK_DEFAULT = SchemeRule(id = "recheck-1", name = "Recheck standar", minAgree = 4)
+
+        fun fromJson(o: JSONObject?): SchemeRule {
+            if (o == null) return ENTRY_DEFAULT
+            return ENTRY_DEFAULT.copy(
+                id = o.optString("id", "entry-1"),
+                name = o.optString("name", "Skema"),
+                enabled = o.optBoolean("enabled", true),
+                requireAllModels = o.optBoolean("requireAllModels", true),
+                minResponded = o.optInt("minResponded", 6),
+                minAgree = o.optInt("minAgree", 4),
+                profitRuleEnabled = o.optBoolean("profitRuleEnabled", true),
+                alignedMinRoi = o.optDouble("alignedMinRoi", 48.0),
+                alignedMinCount = o.optInt("alignedMinCount", 2),
+                misalignedMaxRoi = o.optDouble("misalignedMaxRoi", -35.0),
+                silentProfitBlockEnabled = o.optBoolean("silentProfitBlockEnabled", false),
+                silentProfitMax = o.optDouble("silentProfitMax", 50.0),
+                gapRuleEnabled = o.optBoolean("gapRuleEnabled", true),
+                gapPct = o.optDouble("gapPct", 22.0),
+                gapOnlyIfTopPositive = o.optBoolean("gapOnlyIfTopPositive", true),
+            ).sanitized()
+        }
+    }
+}
+
+/**
+ * Setelan umum Auto: berlaku untuk semua skema.
+ *
+ * Tangga leverage/TP/SL adalah **patokan (checkpoint)**, bukan order TP/SL sungguhan.
+ * Menyentuh level hanya memicu cek model; posisi tetap terbuka.
+ *
+ *  - [tpExtend] ON  → setelah angka terakhir, patokan TP naik terus +[tpStep] (tidak ada TP asli).
+ *    OFF → angka terakhir = **TP asli**: menyentuhnya langsung menutup posisi.
+ *  - [slExtend] ON  → patokan SL melebar terus +[slStep] (tidak ada batas rugi asli).
+ *    OFF → angka terakhir = **SL asli**: menyentuhnya menutup posisi (dan itu SL keras di exchange).
+ */
+data class AutoCommon(
+    // ---- waktu
+    val entryWindowMin: Int = 30,
+    val carryMin: Int = 5,
+    val recheckMin: Int = 25,
+
+    // ---- tangga leverage
+    val leverageLadder: List<Int> = listOf(30, 35, 40),
+    val leverageStep: Int = 5,
+    val maxLeverage: Int = 40,
+
+    // ---- tangga TP (patokan)
+    val tpLadder: List<Double> = listOf(22.0, 34.0, 50.0, 65.0),
+    val tpStep: Double = 15.0,
+    val tpExtend: Boolean = true,
+
+    // ---- tangga SL (patokan)
+    val slLadder: List<Double> = listOf(22.0, 31.0, 40.0),
+    val slStep: Double = 10.0,
+    val slExtend: Boolean = false,
+
+    // ---- aksi saat skema gagal
+    val entryFailAction: String = "CARRY",
+    val entryFailCooldownMin: Int = 30,
+    val recheckFailAction: String = "OUT",
+
+    // ---- berbalik arah (global, dicek sebelum skema recheck)
+    val reversalEnabled: Boolean = true,
+    val reversalMin: Int = 4,
+
+    // ---- daftar skema
+    val entrySchemes: List<SchemeRule> = listOf(SchemeRule.ENTRY_DEFAULT),
+    val recheckSchemes: List<SchemeRule> = listOf(SchemeRule.RECHECK_DEFAULT),
+) {
+    /** Leverage entry pertama. */
+    val entryLeverage: Int get() = leverageLadder.minOrNull() ?: 30
+    /** Patokan TP pertama. */
+    val entryTp: Double get() = tpLadder.minOrNull() ?: 22.0
+    /** Patokan SL pertama. */
+    val entrySl: Double get() = slLadder.minOrNull() ?: 22.0
+    /** Level SL terdalam (selalu dipasang sebagai SL keras di exchange). */
+    val maxSl: Double get() = slLadder.maxOrNull() ?: 40.0
+
+    val activeEntrySchemes: List<SchemeRule> get() = entrySchemes.filter { it.enabled }
+    val activeRecheckSchemes: List<SchemeRule> get() = recheckSchemes.filter { it.enabled }
+
+    fun sanitized(): AutoCommon {
+        val levs = leverageLadder.filter { it in 1..125 }.distinct().sorted().ifEmpty { listOf(30) }
+        val tps = tpLadder.filter { it > 0.0 && it <= 5000.0 }.distinct().sorted().ifEmpty { listOf(22.0) }
+        val sls = slLadder.filter { it > 0.0 && it <= 100.0 }.distinct().sorted().ifEmpty { listOf(40.0) }
+        return copy(
+            entryWindowMin = entryWindowMin.coerceIn(5, 240),
+            carryMin = carryMin.coerceIn(0, 240),
+            recheckMin = recheckMin.coerceIn(5, 240),
+            leverageLadder = levs,
+            maxLeverage = maxLeverage.coerceIn(levs.last(), 125),
+            leverageStep = leverageStep.coerceIn(1, 50),
+            tpLadder = tps,
+            tpStep = tpStep.coerceIn(1.0, 500.0),
+            slLadder = sls,
+            slStep = slStep.coerceIn(1.0, 100.0),
+            entryFailCooldownMin = entryFailCooldownMin.coerceIn(0, 240),
+            entryFailAction = entryFailAction.uppercase().let {
+                if (it in setOf("CARRY", "RESET", "COOLDOWN")) it else "CARRY"
+            },
+            recheckFailAction = recheckFailAction.uppercase().let {
+                if (it in setOf("OUT", "HOLD")) it else "OUT"
+            },
+            reversalMin = reversalMin.coerceIn(1, 6),
+            entrySchemes = entrySchemes.map { it.sanitized() }.ifEmpty { listOf(SchemeRule.ENTRY_DEFAULT) },
+            recheckSchemes = recheckSchemes.map { it.sanitized() }.ifEmpty { listOf(SchemeRule.RECHECK_DEFAULT) },
+        )
+    }
+
+    fun toJson(): String = JSONObject().apply {
+        put("entryWindowMin", entryWindowMin)
+        put("carryMin", carryMin)
+        put("recheckMin", recheckMin)
         put("leverageLadder", JSONArray(leverageLadder))
         put("leverageStep", leverageStep)
         put("maxLeverage", maxLeverage)
         put("tpLadder", JSONArray(tpLadder))
         put("tpStep", tpStep)
+        put("tpExtend", tpExtend)
         put("slLadder", JSONArray(slLadder))
+        put("slStep", slStep)
+        put("slExtend", slExtend)
         put("entryFailAction", entryFailAction)
         put("entryFailCooldownMin", entryFailCooldownMin)
         put("recheckFailAction", recheckFailAction)
+        put("reversalEnabled", reversalEnabled)
+        put("reversalMin", reversalMin)
+        put("entrySchemes", JSONArray(entrySchemes.map { it.toJson() }))
+        put("recheckSchemes", JSONArray(recheckSchemes.map { it.toJson() }))
     }.toString()
 
     companion object {
-        val STANDARD = AutoConfig()
+        val STANDARD = AutoCommon()
 
-        val CONSERVATIVE = AutoConfig(
-            minAgree = 5,
-            alignedMinRoi = 55.0,
-            alignedMinCount = 3,
-            misalignedMaxRoi = -40.0,
-            gapPct = 25.0,
-            reversalMin = 5,
+        val CONSERVATIVE = AutoCommon(
             leverageLadder = listOf(25, 30, 35),
+            entrySchemes = listOf(
+                SchemeRule(
+                    id = "entry-c1", name = "Konservatif 5/6",
+                    minAgree = 5, alignedMinRoi = 55.0, alignedMinCount = 3,
+                    misalignedMaxRoi = -40.0, gapPct = 25.0,
+                ),
+            ),
+            recheckSchemes = listOf(
+                SchemeRule(
+                    id = "recheck-c1", name = "Recheck ketat 5/6",
+                    minAgree = 5, alignedMinRoi = 55.0, alignedMinCount = 3,
+                    misalignedMaxRoi = -40.0, gapPct = 25.0,
+                ),
+            ),
+            reversalMin = 5,
         )
 
-        val AGGRESSIVE = AutoConfig(
-            minAgree = 3,
-            alignedMinRoi = 40.0,
-            alignedMinCount = 2,
-            misalignedMaxRoi = -25.0,
-            gapPct = 30.0,
-            reversalMin = 3,
+        val AGGRESSIVE = AutoCommon(
             leverageLadder = listOf(30, 40, 50),
             maxLeverage = 50,
             tpLadder = listOf(20.0, 40.0, 60.0),
             slLadder = listOf(20.0, 30.0, 45.0),
+            entrySchemes = listOf(
+                SchemeRule(
+                    id = "entry-a1", name = "Agresif 3/6",
+                    minAgree = 3, alignedMinRoi = 40.0, alignedMinCount = 2,
+                    misalignedMaxRoi = -25.0, gapPct = 30.0,
+                ),
+            ),
+            recheckSchemes = listOf(
+                SchemeRule(
+                    id = "recheck-a1", name = "Recheck longgar 3/6",
+                    minAgree = 3, alignedMinRoi = 40.0, alignedMinCount = 2,
+                    misalignedMaxRoi = -25.0, gapPct = 30.0,
+                ),
+            ),
+            reversalMin = 3,
         )
 
         fun parseLadderInts(raw: String): List<Int> =
@@ -177,41 +288,64 @@ data class AutoConfig(
                 .distinct()
                 .sorted()
 
-        fun fromJson(raw: String?): AutoConfig {
+        fun fromJson(raw: String?): AutoCommon {
             if (raw.isNullOrBlank()) return STANDARD
             return try {
                 val o = JSONObject(raw)
+                // Format lama (#29) menyimpan syarat langsung di root; migrasi ke skema tunggal.
+                val legacyScheme = if (!o.has("entrySchemes")) {
+                    SchemeRule.ENTRY_DEFAULT.copy(
+                        requireAllModels = o.optBoolean("requireAllModels", true),
+                        minResponded = o.optInt("minResponded", 6),
+                        minAgree = o.optInt("minAgree", 4),
+                        profitRuleEnabled = o.optBoolean("profitRuleEnabled", true),
+                        alignedMinRoi = o.optDouble("alignedMinRoi", 48.0),
+                        alignedMinCount = o.optInt("alignedMinCount", 2),
+                        misalignedMaxRoi = o.optDouble("misalignedMaxRoi", -35.0),
+                        silentProfitBlockEnabled = o.optBoolean("silentProfitBlockEnabled", false),
+                        silentProfitMax = o.optDouble("silentProfitMax", 50.0),
+                        gapRuleEnabled = o.optBoolean("gapRuleEnabled", true),
+                        gapPct = o.optDouble("gapPct", 22.0),
+                        gapOnlyIfTopPositive = o.optBoolean("gapOnlyIfTopPositive", true),
+                    )
+                } else {
+                    null
+                }
                 STANDARD.copy(
                     entryWindowMin = o.optInt("entryWindowMin", 30),
                     carryMin = o.optInt("carryMin", 5),
                     recheckMin = o.optInt("recheckMin", 25),
-                    minAgree = o.optInt("minAgree", 4),
-                    requireAllModels = o.optBoolean("requireAllModels", true),
-                    minResponded = o.optInt("minResponded", 6),
-                    profitRuleEnabled = o.optBoolean("profitRuleEnabled", true),
-                    alignedMinRoi = o.optDouble("alignedMinRoi", 48.0),
-                    alignedMinCount = o.optInt("alignedMinCount", 2),
-                    misalignedMaxRoi = o.optDouble("misalignedMaxRoi", -35.0),
-                    silentProfitBlockEnabled = o.optBoolean("silentProfitBlockEnabled", false),
-                    silentProfitMax = o.optDouble("silentProfitMax", 50.0),
-                    gapRuleEnabled = o.optBoolean("gapRuleEnabled", true),
-                    gapPct = o.optDouble("gapPct", 22.0),
-                    gapOnlyIfTopPositive = o.optBoolean("gapOnlyIfTopPositive", true),
-                    reversalEnabled = o.optBoolean("reversalEnabled", true),
-                    reversalMin = o.optInt("reversalMin", 4),
                     leverageLadder = intList(o.optJSONArray("leverageLadder"), listOf(30, 35, 40)),
                     leverageStep = o.optInt("leverageStep", 5),
                     maxLeverage = o.optInt("maxLeverage", 40),
                     tpLadder = doubleList(o.optJSONArray("tpLadder"), listOf(22.0, 34.0, 50.0, 65.0)),
                     tpStep = o.optDouble("tpStep", 15.0),
+                    tpExtend = o.optBoolean("tpExtend", true),
                     slLadder = doubleList(o.optJSONArray("slLadder"), listOf(22.0, 31.0, 40.0)),
+                    slStep = o.optDouble("slStep", 10.0),
+                    slExtend = o.optBoolean("slExtend", false),
                     entryFailAction = o.optString("entryFailAction", "CARRY"),
                     entryFailCooldownMin = o.optInt("entryFailCooldownMin", 30),
                     recheckFailAction = o.optString("recheckFailAction", "OUT"),
+                    reversalEnabled = o.optBoolean("reversalEnabled", true),
+                    reversalMin = o.optInt("reversalMin", 4),
+                    entrySchemes = schemes(o.optJSONArray("entrySchemes"), legacyScheme, SchemeRule.ENTRY_DEFAULT),
+                    recheckSchemes = schemes(
+                        o.optJSONArray("recheckSchemes"), legacyScheme, SchemeRule.RECHECK_DEFAULT,
+                    ),
                 ).sanitized()
             } catch (_: Exception) {
                 STANDARD
             }
+        }
+
+        private fun schemes(a: JSONArray?, legacy: SchemeRule?, fallback: SchemeRule): List<SchemeRule> {
+            if (a == null || a.length() == 0) {
+                return listOf(legacy?.copy(id = fallback.id, name = fallback.name) ?: fallback)
+            }
+            val out = ArrayList<SchemeRule>()
+            for (i in 0 until a.length()) out += SchemeRule.fromJson(a.optJSONObject(i))
+            return out.ifEmpty { listOf(fallback) }
         }
 
         private fun intList(a: JSONArray?, fallback: List<Int>): List<Int> {

@@ -98,10 +98,10 @@ object BinanceStore {
         sp(c).edit().putString(K_STATE, value).apply()
 
     /** Skema Auto yang diatur dari aplikasi; engine membacanya tiap loop. */
-    fun autoConfig(c: Context): AutoConfig =
-        AutoConfig.fromJson(sp(c).getString(K_AUTO_CFG, null))
+    fun autoConfig(c: Context): AutoCommon =
+        AutoCommon.fromJson(sp(c).getString(K_AUTO_CFG, null))
 
-    fun setAutoConfig(c: Context, value: AutoConfig) =
+    fun setAutoConfig(c: Context, value: AutoCommon) =
         sp(c).edit().putString(K_AUTO_CFG, value.sanitized().toJson()).apply()
 
     private fun key(): SecretKey {
