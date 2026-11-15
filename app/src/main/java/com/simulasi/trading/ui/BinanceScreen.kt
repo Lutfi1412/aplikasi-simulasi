@@ -151,14 +151,10 @@ fun BinanceScreen(modifier: Modifier = Modifier) {
                 BinanceState.apiEnabled = true
                 MonitorService.start(ctx)
             }
-            if (BinanceState.position != null) {
-                notice = "Tutup posisi dulu sebelum menyalakan Auto"
-                return
-            }
             BinanceStore.setAutoEnabled(ctx, true)
             BinanceState.autoEnabled = true
             AutoEngine.instance?.onAutoEnabled()
-            notice = "Auto ON — semua model dinetralkan"
+            notice = "Auto ON — model netral, posisi (jika ada) diadopsi"
         } else {
             BinanceStore.setAutoEnabled(ctx, false)
             BinanceState.autoEnabled = false
@@ -518,9 +514,10 @@ fun BinanceScreen(modifier: Modifier = Modifier) {
             }
             Spacer(Modifier.height(6.dp))
             Text(
-                "Aturan: 5/6 sinyal sama dalam 23 menit → entry 30x. Patokan aplikasi +22/+34/+50 lalu +15 " +
-                    "dan -22/-31; tiap level dicek 25 menit sebelum lanjut. Exchange hanya menyimpan SL keras -40%. " +
-                    "Gap ROI ≥22% menahan entry 30 menit lalu netral.",
+                "Aturan: 6/6 merespon + ≥5 sepakat → entry langsung 30x (maks 23 menit). Level kena: posisi " +
+                    "tetap jalan, 6 model netral; begitu 6/6 bersinyal langsung dinilai (≥5 selaras = lanjut, " +
+                    "gagal atau 25 menit = out). Level +22/+34/+50 lalu +15; -22/-31; -40 = out. Exchange hanya " +
+                    "SL keras -40%. Gap ROI ≥22% (ROI teratas positif) menahan entry 30 menit lalu netral.",
                 fontSize = 9.sp,
                 color = CMute,
             )
@@ -636,7 +633,7 @@ private fun phaseLabel(phase: String): String = when (phase) {
     "IDLE" -> "Mencari pola"
     "BATCH" -> "Mengumpulkan sinyal"
     "HOLD_ENTRY" -> "Tahan entry"
-    "NEUTRAL_WAIT" -> "Netral / tunggu pola"
+    "NEUTRAL_WAIT", "CORRECTION_WAIT" -> "Koreksi model / tunggu pola"
     "HOLDING" -> "Posisi terbuka"
     "RECHECK" -> "Cek ulang model"
     else -> "Auto off"

@@ -51,7 +51,7 @@ class AutoEngine(private val ctx: Context) {
         private const val SYMBOL = "SOLUSDT"
         private const val ENTRY_WINDOW_MS = 23L * 60_000
         private const val RECHECK_MS = 25L * 60_000
-        private const val NEUTRAL_WAIT_MS = 30L * 60_000
+        private const val CORRECTION_MS = 30L * 60_000
         private const val RETENTION_MS = 5L * 60_000
         private const val HOLD_MS = 30L * 60_000
         private const val GAP_PCT = 22.0
@@ -77,7 +77,7 @@ class AutoEngine(private val ctx: Context) {
         )
     }
 
-    private enum class Phase { IDLE, BATCH, HOLD_ENTRY, NEUTRAL_WAIT, HOLDING, RECHECK }
+    private enum class Phase { IDLE, BATCH, HOLD_ENTRY, CORRECTION_WAIT, HOLDING, RECHECK }
     private data class Sig(val side: Int, val ts: Long)
     private data class ModelSignal(val name: String, val side: Int)
     private data class BotRoi(val model: String, val roiPct: Double)
@@ -109,6 +109,12 @@ class AutoEngine(private val ctx: Context) {
     private val latest = LinkedHashMap<String, Sig>()
     private val current = LinkedHashMap<String, Int>()
     private val lastSeen = LinkedHashMap<String, Long>()
+    /** Sinyal yang terkumpul selama window cek 25 menit (menit 0 = patokan tersentuh). */
+    private val recheckSigs = LinkedHashMap<String, Sig>()
+    /** Waktu snapshot terakhir saat patokan tersentuh; sinyal yang lebih lama tidak dihitung. */
+    private var recheckSnapshotAt = 0L
+    /** Berapa kali batch tidak lengkap sudah di-carryover pada siklus entry ini (maks 1). */
+    private var carryCount = 0
     private var seeded = false
     private var modelNames: List<String> = DEFAULT_MODELS
 
@@ -346,7 +352,7 @@ class AutoEngine(private val ctx: Context) {
             seeded = true
             return
         }
-        if (phase == Phase.NEUTRAL_WAIT) return
+        if (phase == Phase.CORRECTION_WAIT) return
 
         for (m in snap.models) {
             current[m.name] = m.side
@@ -354,11 +360,23 @@ class AutoEngine(private val ctx: Context) {
             val sig = Sig(m.side, now)
             latest[m.name] = sig
             lastSeen[m.name] = now
-            if (phase == Phase.IDLE || phase == Phase.BATCH) {
-                if (batch.isEmpty()) batchStart = now
-                val old = batch[m.name]
-                if (old == null || old.side != m.side) batch[m.name] = sig
-                if (phase == Phase.IDLE) phase = Phase.BATCH
+            when (phase) {
+                Phase.IDLE, Phase.BATCH -> {
+                    if (batch.isEmpty()) batchStart = now
+                    // Sinyal searah yang berulang tetap dianggap aktif (timestamp diperbarui).
+                    batch[m.name] = sig
+                    if (phase == Phase.IDLE) phase = Phase.BATCH
+                }
+                Phase.HOLD_ENTRY -> {
+                    // Selama masa tahan 30 menit, stance terakhir tiap model tetap diperbarui.
+                    batch[m.name] = sig
+                }
+                Phase.RECHECK -> {
+                    // Kumpulkan sepanjang window 25 menit; arah terakhir yang dipakai menilai.
+                    // Snapshot yang sudah ada sebelum patokan tersentuh tidak dihitung.
+                    if (lastSnapshotAt > recheckSnapshotAt) recheckSigs[m.name] = sig
+                }
+                else -> {}
             }
         }
     }
@@ -373,8 +391,8 @@ class AutoEngine(private val ctx: Context) {
             Phase.RECHECK -> if (pos == null) onPositionClosedExternally(now) else continueAfterRecheck(pos, now, snap)
             Phase.BATCH -> if (pos != null) adopt(pos) else evaluateBatch(now, snap)
             Phase.HOLD_ENTRY -> if (pos != null) adopt(pos) else evaluateHold(now, snap)
-            Phase.NEUTRAL_WAIT -> {
-                if (pos != null) adopt(pos) else if (now >= neutralUntil) resetNeutral()
+            Phase.CORRECTION_WAIT -> {
+                if (pos != null) adopt(pos) else if (now >= neutralUntil) finishCorrection()
             }
             Phase.IDLE -> if (pos != null) adopt(pos)
         }
@@ -383,34 +401,42 @@ class AutoEngine(private val ctx: Context) {
 
     private suspend fun evaluateBatch(now: Long, snap: SnapshotData) {
         val total = modelNames.size.coerceAtLeast(1)
+
+        // Semua 6 sudah pernah bersinyal -> evaluasi SEKARANG, jangan tunggu 23 menit.
+        if (batch.size >= total) {
+            val longs = batch.values.count { it.side > 0 }
+            val shorts = batch.size - longs
+            val majority = if (longs >= shorts) 1 else -1
+            val agree = max(longs, shorts)
+            if (agree < MIN_AGREE) {
+                startCorrection(now, "sinyal sepakat hanya $agree/$total — koreksi 30 menit")
+                return
+            }
+            tryEnter(majority, now, snap, "entry $agree/$total")
+            return
+        }
+
         val deadline = batchStart + ENTRY_WINDOW_MS
         if (now < deadline) return
 
-        if (batch.size < total) {
-            val responded = batch.size
-            val cutoff = deadline - RETENTION_MS
-            val keep = batch.filterValues { it.ts >= cutoff }
+        val responded = batch.size
+        val cutoff = deadline - RETENTION_MS
+        val keep = batch.filterValues { it.ts >= cutoff }
+        if (carryCount == 0 && keep.isNotEmpty()) {
+            carryCount = 1
             batch.clear()
             batch.putAll(keep)
-            if (keep.isNotEmpty()) {
-                batchStart = keep.values.minOf { it.ts }
-                log("entry gagal: $responded/$total merespon — ${keep.size} sinyal terakhir dibawa ke batch berikutnya")
-                saveState()
-            } else {
-                neutral("entry gagal: hanya $responded/$total model merespon — netral 30 menit", now, clearNow = true)
-            }
+            batchStart = keep.values.minOf { it.ts }
+            log("entry gagal: $responded/$total merespon — ${keep.size} sinyal dibawa ke batch berikutnya (carryover 1/1)")
+            saveState()
             return
         }
 
-        val longs = batch.values.count { it.side > 0 }
-        val shorts = batch.size - longs
-        val majority = if (longs >= shorts) 1 else -1
-        val agree = max(longs, shorts)
-        if (agree < MIN_AGREE) {
-            neutral("sinyal sepakat hanya $agree/$total — netral 30 menit", now, clearNow = false)
-            return
-        }
-        tryEnter(majority, now, snap, "entry $agree/$total")
+        log("entry gagal: $responded/$total merespon — netral semua, pola baru")
+        neutralizeAllModels("batch tidak lengkap")
+        clearState()
+        phase = Phase.IDLE
+        saveState()
     }
 
     /**
@@ -422,29 +448,20 @@ class AutoEngine(private val ctx: Context) {
     private suspend fun evaluateHold(now: Long, snap: SnapshotData) {
         if (now < holdUntil) return
         val total = modelNames.size.coerceAtLeast(1)
-        val responded = modelNames.count { (current[it] ?: 0) != 0 }
-        val longs = modelNames.count { (current[it] ?: 0) > 0 }
-        val shorts = modelNames.count { (current[it] ?: 0) < 0 }
+        val responded = batch.size
+        val longs = batch.values.count { it.side > 0 }
+        val shorts = batch.size - longs
         val majority = if (longs >= shorts) 1 else -1
         val agree = max(longs, shorts)
         if (responded >= total && agree >= MIN_AGREE && !roiGapBlocks(majority, snap)) {
             doEntry(majority, holdLeverage, holdTp, holdSl, now, snap, "entry setelah tahan 30 menit")
             return
         }
-        batch.clear()
-        latest.clear()
-        current.clear()
-        batchStart = 0
-        holdUntil = 0
-        phase = Phase.NEUTRAL_WAIT
-        neutralUntil = now + NEUTRAL_WAIT_MS
-        log("masa tahan habis (${responded}/$total respon, $agree selaras) — semua model dinetralkan, ulangi pola")
+        log("masa tahan habis (${responded}/$total respon, $agree selaras, gap masih ada) — netral semua, pola baru")
         neutralizeAllModels("masa tahan habis")
+        clearState()
+        phase = Phase.IDLE
         saveState()
-        ui {
-            BinanceState.autoPhase = "NEUTRAL_WAIT"
-            BinanceState.autoDetail = "Netral · pola baru ${mmss(neutralUntil - now)}"
-        }
     }
 
     /**
@@ -473,21 +490,24 @@ class AutoEngine(private val ctx: Context) {
             lastRoi = direction * (mark / entryPrice - 1) * leverage * 100
         }
 
-        if (now < recheckUntil) return
-
         val total = modelNames.size.coerceAtLeast(1)
-        val responded = modelNames.count { (current[it] ?: 0) != 0 }
+        val responded = recheckSigs.size
         if (responded < total) {
+            // Belum 6/6: tunggu sampai batas 25 menit, lalu out.
+            if (now < recheckUntil) return
             exitAfterRecheck("cek 25 menit gagal: hanya $responded/$total merespon", now)
             return
         }
-        val aligned = modelNames.count { current[it] == direction }
+
+        // 6/6 sudah pernah bersinyal -> langsung nilai (tidak menunggu sisa window).
+        // Arah tiap model = sinyal terakhirnya; yang tidak pernah bersinyal menggagalkan cek.
+        val aligned = recheckSigs.values.count { it.side == direction }
         if (aligned < MIN_AGREE) {
-            exitAfterRecheck("cek 25 menit: hanya $aligned/$total selaras arah posisi", now)
+            exitAfterRecheck("cek model: hanya $aligned/$total selaras arah posisi", now)
             return
         }
         if (roiGapBlocks(direction, snap)) {
-            exitAfterRecheck("cek 25 menit: model ROI tertinggi berbalik arah (gap ≥ 22%)", now)
+            exitAfterRecheck("cek model: model ROI tertinggi berbalik arah (gap ≥ 22%)", now)
             return
         }
 
@@ -511,6 +531,7 @@ class AutoEngine(private val ctx: Context) {
         recheckStart = 0
         recheckUntil = 0
         recheckKind = ""
+        recheckSigs.clear()
         val dirText = if (direction > 0) "LONG" else "SHORT"
         log(
             "$dirText lanjut (${aligned}/${total} selaras) · leverage ${leverage}x · " +
@@ -573,10 +594,14 @@ class AutoEngine(private val ctx: Context) {
         val sorted = snap.bots.sortedByDescending { it.roiPct }
         val top = sorted[0]
         val second = sorted[1]
+        // Hanya berlaku kalau model teratas benar-benar profit.
+        if (top.roiPct <= 0) return false
         if (top.roiPct - second.roiPct < GAP_PCT) return false
-        val topSide = current[top.model]
-            ?: batch[top.model]?.side
+        // Arah model teratas = sinyal terakhirnya (batch/recheck), bukan stance menit ini.
+        val topSide = batch[top.model]?.side
+            ?: recheckSigs[top.model]?.side
             ?: latest[top.model]?.side
+            ?: current[top.model]
             ?: return false
         if (topSide == 0) return false
         return topSide != dir
@@ -659,6 +684,8 @@ class AutoEngine(private val ctx: Context) {
             phase = Phase.HOLDING
             batch.clear()
             latest.clear()
+            recheckSigs.clear()
+            carryCount = 0
             seeded = true
             lastProtectCheck = now
 
@@ -781,6 +808,9 @@ class AutoEngine(private val ctx: Context) {
         recheckKind = kind
         recheckStart = now
         recheckUntil = now + RECHECK_MS
+        recheckSigs.clear()
+        recheckSnapshotAt = lastSnapshotAt
+        carryCount = 0
 
         // siapkan tangga berikutnya (dipakai hanya kalau lolos cek 25 menit)
         if (kind == "TP") {
@@ -821,7 +851,7 @@ class AutoEngine(private val ctx: Context) {
         saveState()
     }
 
-    private fun adopt(pos: BinancePosition) {
+    private suspend fun adopt(pos: BinancePosition) {
         direction = if (pos.isLong) 1 else -1
         leverage = pos.leverage.coerceAtLeast(1)
         entryPrice = pos.entryPrice
@@ -830,7 +860,20 @@ class AutoEngine(private val ctx: Context) {
         val mark = pos.markPrice.takeIf { it > 0 } ?: lastMark
         lastRoi = if (entryPrice > 0 && mark > 0) direction * (mark / entryPrice - 1) * leverage * 100 else 0.0
         phase = Phase.HOLDING
+        recheckSigs.clear()
+        carryCount = 0
         log("posisi lama diadopsi ${if (direction > 0) "LONG" else "SHORT"} @ ${priceText(entryPrice)} · ROI ${lastRoi.toInt()}%")
+        val client = api
+        if (client != null && entryPrice > 0) {
+            try {
+                // Auto hanya memakai SL keras -40%; order manual lama diganti.
+                client.cancelAll(SYMBOL)
+                placeHardStop(client, direction, entryPrice, leverage)
+                log("SL keras -${HARD_SL_ROI.toInt()}% dipasang untuk posisi adopsi")
+            } catch (e: Exception) {
+                log("gagal memasang SL keras pada posisi adopsi: ${e.message}")
+            }
+        }
         saveState()
     }
 
@@ -993,29 +1036,32 @@ class AutoEngine(private val ctx: Context) {
 
     // ---------------------------------------------------------------- state
 
-    private fun neutral(msg: String, now: Long, clearNow: Boolean) {
+    /**
+     * Semua model sudah merespon tapi sepakat <5/6: beri 30 menit untuk saling koreksi
+     * (model TIDAK dinetralkan dulu), setelah itu baru netral semua dan mulai pola baru.
+     */
+    private fun startCorrection(now: Long, msg: String) {
         log(msg)
-        neutralizeAllModels("netral")
-        phase = Phase.NEUTRAL_WAIT
-        neutralUntil = now + NEUTRAL_WAIT_MS
-        if (clearNow) {
-            batch.clear()
-            latest.clear()
-        }
-        saveState()
-    }
-
-    private fun resetNeutral() {
-        phase = Phase.IDLE
+        phase = Phase.CORRECTION_WAIT
+        neutralUntil = now + CORRECTION_MS
         batch.clear()
         latest.clear()
-        current.clear()
-        lastSeen.clear()
+        recheckSigs.clear()
         batchStart = 0
-        holdUntil = 0
-        neutralUntil = 0
-        seeded = true
-        log("netral — menunggu pola baru")
+        carryCount = 0
+        saveState()
+        ui {
+            BinanceState.autoPhase = "CORRECTION_WAIT"
+            BinanceState.autoDetail = "Koreksi model ${mmss(neutralUntil - now)}"
+        }
+    }
+
+    /** 30 menit koreksi selesai: netralkan semua model lalu mulai pola baru. */
+    private fun finishCorrection() {
+        log("koreksi 30 menit selesai — netral semua, pola baru")
+        neutralizeAllModels("koreksi 30 menit selesai")
+        clearState()
+        phase = Phase.IDLE
         saveState()
     }
 
@@ -1024,6 +1070,8 @@ class AutoEngine(private val ctx: Context) {
         latest.clear()
         current.clear()
         lastSeen.clear()
+        recheckSigs.clear()
+        carryCount = 0
         batchStart = 0
         holdUntil = 0
         neutralUntil = 0
@@ -1078,17 +1126,18 @@ class AutoEngine(private val ctx: Context) {
                 aligned = max(longs, batch.size - longs)
                 "Tahan entry (gap ROI) · netral dalam ${mmss(holdUntil - now)}"
             }
-            Phase.NEUTRAL_WAIT -> "Netral · pola baru ${mmss(neutralUntil - now)}"
+            Phase.CORRECTION_WAIT ->
+                "Koreksi model (model bebas koreksi) · pola baru ${mmss(neutralUntil - now)}"
             Phase.HOLDING -> {
                 responded = modelNames.count { (current[it] ?: 0) != 0 }
                 aligned = modelNames.count { current[it] == direction }
                 "${if (direction > 0) "LONG" else "SHORT"} ${leverage}x · ROI ${lastRoi.toInt()}% · target +${tpLevel.toInt()}% / -${slLevel.toInt()}%"
             }
             Phase.RECHECK -> {
-                responded = modelNames.count { (current[it] ?: 0) != 0 }
-                aligned = modelNames.count { current[it] == direction }
+                responded = recheckSigs.size
+                aligned = recheckSigs.values.count { it.side == direction }
                 val hit = if (recheckKind == "TP") "+${tpLevel.toInt()}%" else "-${slLevel.toInt()}%"
-                "Posisi MASIH JALAN ${leverage}x · ROI ${lastRoi.toInt()}% · cek $hit sisa ${mmss(recheckUntil - now)}"
+                "Posisi MASIH JALAN ${leverage}x · ROI ${lastRoi.toInt()}% · model $responded/$total · cek $hit sisa ${mmss(recheckUntil - now)}"
             }
             Phase.IDLE -> "Menunggu pola 5/6 · $total model"
         }
@@ -1136,6 +1185,8 @@ class AutoEngine(private val ctx: Context) {
             o.put("lastRoi", lastRoi)
             o.put("batch", sigMapToJson(batch))
             o.put("latest", sigMapToJson(latest))
+            o.put("recheckSigs", sigMapToJson(recheckSigs))
+            o.put("carryCount", carryCount)
             val seen = JSONObject()
             for ((k, v) in lastSeen) seen.put(k, v)
             o.put("lastSeen", seen)
@@ -1150,8 +1201,13 @@ class AutoEngine(private val ctx: Context) {
         val raw = BinanceStore.autoState(ctx) ?: return
         try {
             val o = JSONObject(raw)
-            phase = runCatching { Phase.valueOf(o.optString("phase", "IDLE")) }
-                .getOrDefault(Phase.IDLE)
+            val savedPhase = o.optString("phase", "IDLE")
+            // State lama memakai NEUTRAL_WAIT; sekarang artinya koreksi 30 menit.
+            phase = if (savedPhase == "NEUTRAL_WAIT") {
+                Phase.CORRECTION_WAIT
+            } else {
+                runCatching { Phase.valueOf(savedPhase) }.getOrDefault(Phase.IDLE)
+            }
             batchStart = o.optLong("batchStart", 0)
             seeded = o.optBoolean("seeded", false)
             direction = o.optInt("direction", 0)
@@ -1174,6 +1230,8 @@ class AutoEngine(private val ctx: Context) {
             lastRoi = o.optDouble("lastRoi", 0.0)
             readSigMap(o.optJSONObject("batch"), batch)
             readSigMap(o.optJSONObject("latest"), latest)
+            readSigMap(o.optJSONObject("recheckSigs"), recheckSigs)
+            carryCount = o.optInt("carryCount", 0)
             val seen = o.optJSONObject("lastSeen") ?: JSONObject()
             for (k in seen.keys()) lastSeen[k] = seen.optLong(k, 0)
         } catch (_: Exception) {
