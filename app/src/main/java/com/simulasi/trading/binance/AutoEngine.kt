@@ -74,6 +74,17 @@ class AutoEngine(private val ctx: Context) {
         private const val NEUTRAL_ATTEMPTS = 5
         private const val NEUTRAL_RETRY_MS = 2_000L
 
+        /** Fee taker Binance Futures (0,05%) — dipakai menyisakan margin untuk fee. */
+        private const val TAKER_FEE = 0.0005
+        /** Cadangan tambahan untuk selisih mark price vs harga fill. */
+        private const val SLIPPAGE_RESERVE = 0.01
+        /** Berapa kali order entry diperkecil otomatis kalau Binance menolak margin. */
+        private const val ENTRY_SHRINK_TRIES = 3
+        /** Kode Binance yang berarti "margin/ukuran kurang" → layak dicoba lebih kecil. */
+        private val SHRINKABLE_CODES = setOf(-2019, -2013, -4003, -1013, -2020)
+        /** Bentuk IPv4 valid untuk fallback IP publik. */
+        private val IPV4 = Regex("""^(?:\d{1,3}\.){3}\d{1,3}$""")
+
         private val DEFAULT_MODELS = listOf(
             "Aturan dominasi",
             "Regresi Logistik",
@@ -379,6 +390,11 @@ class AutoEngine(private val ctx: Context) {
         val client = ensureApi(creds) ?: return
         val account = try {
             client.account()
+        } catch (e: BinanceException) {
+            // Kasus paling umum: API key dibatasi IP dan IP HP berubah → Binance
+            // mengembalikan -2015 beserta IP-nya. Simpan supaya bisa disalin pengguna.
+            fail(e)
+            return
         } catch (e: Exception) {
             fail(e.message ?: "gagal mengambil saldo")
             return
@@ -425,6 +441,9 @@ class AutoEngine(private val ctx: Context) {
             try {
                 fresh.syncTime()
                 fresh.refreshHedgeMode()
+            } catch (e: BinanceException) {
+                fail(e)
+                return null
             } catch (e: Exception) {
                 fail(e.message ?: "gagal konek ke Binance")
                 return null
@@ -1056,7 +1075,7 @@ class AutoEngine(private val ctx: Context) {
             equity >= 27.4 -> 50.0
             else -> 100.0
         }
-        val margin = min(equity * pct / 100.0, account.availableBalance * 0.98)
+        val margin = safeMargin(equity, account.availableBalance, pct, lev)
         if (margin <= 0.5) {
             fail("margin terlalu kecil (${money(margin)} USDT)")
             return
@@ -1065,18 +1084,7 @@ class AutoEngine(private val ctx: Context) {
         busy(true)
         try {
             client.setLeverage(SYMBOL, lev)
-            val rules = client.rules(SYMBOL)
-            val qtyText = client.formatQty(margin * lev / price, rules)
-            val qty = qtyText.toDoubleOrNull() ?: 0.0
-            if (qty <= 0 || qty * price < rules.minNotional) {
-                throw IllegalStateException("qty di bawah minimum (${rules.minNotional} USDT)")
-            }
-
-            val side = if (dir > 0) "BUY" else "SELL"
-            val posSide = if (client.hedgeMode) (if (dir > 0) "LONG" else "SHORT") else null
-            log("entry ${if (dir > 0) "LONG" else "SHORT"} ${lev}x · margin ${money(margin)} · $reason")
-            client.marketOrder(SYMBOL, side, qtyText, clientId("e"), positionSide = posSide)
-
+            val usedMargin = placeEntry(client, dir, margin, lev, price)
             val pos = waitForPosition(System.currentTimeMillis() + 8_000)
                 ?: throw IllegalStateException("posisi tidak muncul setelah order")
             val entry = pos.entryPrice.takeIf { it > 0 } ?: price
@@ -1098,7 +1106,7 @@ class AutoEngine(private val ctx: Context) {
             ui { BinanceState.autoBlock = "" }
 
             log(
-                "posisi ${if (dir > 0) "LONG" else "SHORT"} @ ${priceText(entry)} · " +
+                "posisi ${if (dir > 0) "LONG" else "SHORT"} @ ${priceText(entry)} · margin ${money(usedMargin)} · " +
                     "patokan app +${tpPct.toInt()}% / -${slPct.toInt()}% · SL keras -${hardSlRoi.toInt()}%",
             )
             notify("Auto ${if (dir > 0) "LONG" else "SHORT"} $lev x · patokan +${tpPct.toInt()}% / -${slPct.toInt()}%")
@@ -1114,6 +1122,70 @@ class AutoEngine(private val ctx: Context) {
         } finally {
             busy(false)
         }
+    }
+
+    /**
+     * Margin yang aman dipakai: persen equity, tapi **disisakan untuk fee & slippage**.
+     *
+     * Dulu `availableBalance * 0.98` hanya menyisakan 2%, padahal fee taker saja sudah
+     * `0.05% × leverage` dari margin (leverage 30 ≈ 1,5% equity) — belum harga geser antara
+     * mark price dan harga fill. Akibatnya order lolos cek lokal tapi ditolak Binance dengan
+     * "Margin is insufficient" (-2019), terutama saat saldo kecil (mis. 3 USDT).
+     */
+    private fun safeMargin(equity: Double, available: Double, pct: Double, lev: Int): Double {
+        val desired = equity * pct / 100.0
+        // Fee taker buka + tutup, plus slippage kecil sebagai cadangan.
+        val feePerMargin = TAKER_FEE * lev * 2.0
+        val reserveFactor = 1.0 - feePerMargin - SLIPPAGE_RESERVE
+        val maxUsable = (available * reserveFactor).coerceAtLeast(0.0)
+        return min(desired, maxUsable)
+    }
+
+    /**
+     * Kirim market order entry dengan ukuran yang menyesuaikan penolakan Binance.
+     *
+     * Kalau exchange menolak karena margin/notional (mis. `-2019` "Margin is insufficient",
+     * `-2013`, `-4003`, `-1013`), margin diperkecil lalu dicoba lagi — sampai
+     * [ENTRY_SHRINK_TRIES] kali atau tidak ada ruang lagi.
+     */
+    private suspend fun placeEntry(
+        client: BinanceApi,
+        dir: Int,
+        marginStart: Double,
+        lev: Int,
+        price: Double,
+    ): Double {
+        val rules = client.rules(SYMBOL)
+        val side = if (dir > 0) "BUY" else "SELL"
+        val posSide = if (client.hedgeMode) (if (dir > 0) "LONG" else "SHORT") else null
+        var margin = marginStart
+        var lastError: Exception? = null
+
+        for (attempt in 1..ENTRY_SHRINK_TRIES) {
+            val qtyText = client.formatQty(margin * lev / price, rules)
+            val qty = qtyText.toDoubleOrNull() ?: 0.0
+            if (qty <= 0 || qty * price < rules.minNotional) {
+                throw IllegalStateException(
+                    "qty di bawah minimum (${rules.minNotional} USDT) — " +
+                        "margin ${money(margin)} × ${lev}x = ${money(margin * lev)} USDT",
+                )
+            }
+            try {
+                log("entry ${if (dir > 0) "LONG" else "SHORT"} ${lev}x · margin ${money(margin)} · qty $qtyText")
+                client.marketOrder(SYMBOL, side, qtyText, clientId("e"), positionSide = posSide)
+                return margin
+            } catch (e: BinanceException) {
+                if (e.code !in SHRINKABLE_CODES) throw e
+                lastError = e
+                val next = margin * 0.8
+                log("order ditolak (${e.code}: ${e.message}) — coba lagi dengan margin ${money(next)}")
+                if (next * lev < rules.minNotional) {
+                    throw IllegalStateException("margin ${money(margin)} tidak cukup: ${e.message}")
+                }
+                margin = next
+            }
+        }
+        throw lastError ?: IllegalStateException("entry gagal")
     }
 
     /**
@@ -1401,10 +1473,23 @@ class AutoEngine(private val ctx: Context) {
                     ?: throw IllegalStateException("harga tidak tersedia")
                 client.setLeverage(SYMBOL, lev)
                 val rules = client.rules(SYMBOL)
+                // Margin manual dihormati apa adanya, tapi dicek dulu terhadap saldo yang
+                // benar-benar bisa dipakai (fee & slippage disisakan) supaya tidak ditolak
+                // Binance dengan "Margin is insufficient" tanpa penjelasan.
+                val maxUsable = account.availableBalance * (1.0 - TAKER_FEE * lev * 2.0 - SLIPPAGE_RESERVE)
+                if (marginUsd > maxUsable) {
+                    throw IllegalStateException(
+                        "margin ${money(marginUsd)} melebihi batas ${money(maxUsable)} USDT " +
+                            "(available ${money(account.availableBalance)}, fee ${lev}x disisakan)",
+                    )
+                }
                 val qtyText = client.formatQty(marginUsd * lev / price, rules)
                 val qty = qtyText.toDoubleOrNull() ?: 0.0
                 if (qty <= 0 || qty * price < rules.minNotional) {
-                    throw IllegalStateException("margin di bawah minimum")
+                    throw IllegalStateException(
+                        "margin ${money(marginUsd)} × ${lev}x = ${money(marginUsd * lev)} USDT, " +
+                            "di bawah notional minimum ${money(rules.minNotional)} USDT",
+                    )
                 }
                 val side = if (dir > 0) "BUY" else "SELL"
                 val posSide = if (client.hedgeMode) (if (dir > 0) "LONG" else "SHORT") else null
@@ -1547,6 +1632,7 @@ class AutoEngine(private val ctx: Context) {
         ui {
             BinanceState.connected = true
             BinanceState.lastError = null
+            BinanceState.blockedIp = null
             BinanceState.lastUpdate = System.currentTimeMillis()
             BinanceState.walletBalance = acc.walletBalance
             BinanceState.availableBalance = acc.availableBalance
@@ -1732,6 +1818,74 @@ class AutoEngine(private val ctx: Context) {
             BinanceState.connected = false
             BinanceState.lastError = msg
             BinanceState.lastUpdate = System.currentTimeMillis()
+        }
+    }
+
+    /**
+     * Gagal konek karena alasan Binance. Kalau errornya soal API key/IP, IP yang dilihat
+     * Binance disimpan supaya bisa disalin ke whitelist (tombol "Salin IP" di tab Binance).
+     */
+    private fun fail(e: BinanceException) {
+        val ip = e.requestIp
+        ui {
+            BinanceState.connected = false
+            BinanceState.lastError = e.message
+            BinanceState.blockedIp = ip
+            BinanceState.lastUpdate = System.currentTimeMillis()
+        }
+        if (e.isIpBlock) {
+            log("Binance menolak API key/IP (${e.code}): ${e.message}")
+            // Sebagian pesan Binance tidak menyertakan IP. Ambil IP publik sendiri supaya
+            // pengguna tetap bisa menyalinnya ke whitelist.
+            if (ip == null) scope.launch { resolvePublicIp() }
+        }
+    }
+
+    /** Ambil IP publik perangkat lewat layanan teks polos (fallback saat Binance diam). */
+    private suspend fun resolvePublicIp() {
+        for (url in listOf("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com")) {
+            try {
+                val req = Request.Builder().url(url).header("cache-control", "no-store").build()
+                http.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use
+                    val ip = resp.body?.string()?.trim().orEmpty()
+                    if (IPV4.matches(ip)) {
+                        ui { if (BinanceState.blockedIp == null) BinanceState.blockedIp = ip }
+                        return
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /**
+     * Tombol "Cek IP saya" di tab Binance: ambil IP publik perangkat sekarang juga,
+     * supaya bisa disalin ke whitelist Binance tanpa menunggu error -2015.
+     */
+    fun checkPublicIp() {
+        if (BinanceState.ipLoading) return
+        ui { BinanceState.ipLoading = true }
+        scope.launch {
+            try {
+                for (url in listOf("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com")) {
+                    try {
+                        val req = Request.Builder().url(url).header("cache-control", "no-store").build()
+                        http.newCall(req).execute().use { resp ->
+                            if (!resp.isSuccessful) return@use
+                            val ip = resp.body?.string()?.trim().orEmpty()
+                            if (IPV4.matches(ip)) {
+                                ui { BinanceState.blockedIp = ip }
+                                return@launch
+                            }
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+                log("gagal mengambil IP publik (tidak ada koneksi ke layanan IP)")
+            } finally {
+                ui { BinanceState.ipLoading = false }
+            }
         }
     }
 

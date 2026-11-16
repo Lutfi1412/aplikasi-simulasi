@@ -21,6 +21,10 @@ object BinanceState {
     var position by mutableStateOf<BinancePosition?>(null)
 
     var lastError by mutableStateOf<String?>(null)
+    /** IP publik yang dilaporkan Binance saat API key ditolak (bisa disalin ke whitelist). */
+    var blockedIp by mutableStateOf<String?>(null)
+    /** true saat aplikasi sedang mengambil IP publik sendiri ("Cek IP saya"). */
+    var ipLoading by mutableStateOf(false)
     var lastUpdate by mutableStateOf(0L)
 
     var autoPhase by mutableStateOf("OFF")
@@ -53,6 +57,8 @@ object BinanceState {
         position = null
         autoPhase = "OFF"
         autoDetail = "API Binance mati"
+        blockedIp = null
+        ipLoading = false
         modelsResponded = 0
         modelsAligned = 0
         direction = 0

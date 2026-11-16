@@ -1,5 +1,8 @@
 package com.simulasi.trading.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import androidx.compose.foundation.background
@@ -297,7 +300,91 @@ fun BinanceScreen(modifier: Modifier = Modifier) {
                 )
             }
             BinanceState.lastError?.let {
-                Text(it, fontSize = 9.sp, color = CRed)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(it, fontSize = 9.sp, color = CRed, modifier = Modifier.weight(1f))
+                    if (BinanceState.blockedIp != null) {
+                        TextButton(onClick = {
+                            val ip = BinanceState.blockedIp ?: return@TextButton
+                            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            cm?.setPrimaryClip(ClipData.newPlainText("IP Binance", ip))
+                            notice = "IP $ip disalin — tempel di whitelist API Binance"
+                        }) { Text("Salin IP", fontSize = 9.sp, color = CCyan) }
+                    }
+                }
+            }
+            // Selalu tersedia: ambil IP publik perangkat kapan pun (tanpa menunggu error).
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Whitelist API Binance butuh IP publik HP ini.",
+                    fontSize = 9.sp,
+                    color = CMute,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(
+                    onClick = {
+                        val engine = AutoEngine.instance
+                        if (engine == null) {
+                            notice = "Layanan Binance belum siap"
+                        } else {
+                            engine.checkPublicIp()
+                        }
+                    },
+                ) {
+                    Text(
+                        if (BinanceState.ipLoading) "Mengambil…" else "Cek IP saya",
+                        fontSize = 9.sp,
+                        color = CCyan,
+                    )
+                }
+            }
+            // Kartu IP: muncul saat Binance menolak API key karena IP belum terdaftar.
+            // Binance menyertakan IP yang ia lihat di pesan error (-2015), jadi bisa
+            // disalin sekali tekan lalu ditempel di pengaturan API key Binance.
+            BinanceState.blockedIp?.let { ip ->
+                Spacer(Modifier.height(6.dp))
+                Surface(
+                    color = Color(0xFF2A1F0A),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(Modifier.padding(8.dp)) {
+                        Text(
+                            "IP ini belum terdaftar di API Binance",
+                            color = CAmber,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Binance menolak API key dari IP di bawah. Salin, lalu tempel di " +
+                                "Binance → API Management → Edit restrictions → Restrict access to trusted IPs only.",
+                            color = CMute,
+                            fontSize = 9.sp,
+                            lineHeight = 12.sp,
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                ip,
+                                color = CText,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Button(
+                                onClick = {
+                                    val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                    cm?.setPrimaryClip(ClipData.newPlainText("IP Binance", ip))
+                                    notice = "IP $ip disalin ke clipboard"
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = CCyan),
+                                contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                                    horizontal = 12.dp, vertical = 4.dp,
+                                ),
+                            ) { Text("Salin IP", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.Black) }
+                        }
+                    }
+                }
             }
         }
 

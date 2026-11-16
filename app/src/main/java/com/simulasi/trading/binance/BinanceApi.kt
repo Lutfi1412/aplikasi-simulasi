@@ -17,7 +17,24 @@ import javax.crypto.spec.SecretKeySpec
 import kotlin.math.abs
 import kotlin.math.floor
 
-class BinanceException(val code: Int, message: String) : Exception(message)
+/**
+ * Error dari Binance. Untuk `-2015` (API-key/IP tidak diizinkan) pesan Binance kadang
+ * menyertakan IP yang dilihat server (`request ip: 103.x.x.x`). Kalau tidak ada, aplikasi
+ * mengambil IP publiknya sendiri supaya tetap bisa disalin ke whitelist Binance.
+ */
+class BinanceException(val code: Int, message: String) : Exception(message) {
+    /** IP publik yang dilihat Binance, kalau pesannya menyertakannya. */
+    val requestIp: String? = IPV4_PATTERN.find(message)?.value
+
+    /** Error ini soal API key / IP / izin (bukan soal saldo atau jaringan)? */
+    val isIpBlock: Boolean = code == -2015 || code == -2014 ||
+        message.contains("Invalid API-key", ignoreCase = true)
+
+    private companion object {
+        /** IPv4 di mana pun dalam pesan (Binance menulis "request ip: a.b.c.d"). */
+        val IPV4_PATTERN = Regex("""\b(?:\d{1,3}\.){3}\d{1,3}\b""")
+    }
+}
 
 data class BinancePosition(
     val symbol: String,
