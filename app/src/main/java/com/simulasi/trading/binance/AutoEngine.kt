@@ -49,6 +49,14 @@ import kotlin.math.min
  *  - Di exchange hanya dipasang **SL keras -40% ROI** (closePosition) sebagai pengaman
  *    terakhir kalau aplikasi/HP mati. Tidak ada order TP di exchange.
  *
+ * Revisi #31:
+ *  - "Respon" = model yang sinyalnya **non-zero SEKARANG** (sama dengan Home), bukan model
+ *    yang pernah bersinyal lalu kembali netral. Sinyal yang kembali 0 dikeluarkan dari window.
+ *  - Window habis (30 menit) tetap **dibandingkan** dulu dengan data yang ada; kalau semua
+ *    skema gagal baru aksi gagal (carry/reset/cooldown) dijalankan.
+ *  - Home dijaga netral berkala ([AutoCommon.homeNeutralSec]) supaya tidak ada model yang
+ *    "ditangguhkan" setelah Auto ON.
+ *
  * Sumber sinyal: /api/snapshot (6 model, sinyal per menit + roiPct untuk skema profit/gap).
  * Kredensial: BinanceStore (Android Keystore). Tidak ada kunci yang dikirim ke VPS.
  */
@@ -99,14 +107,28 @@ class AutoEngine(private val ctx: Context) {
 
     private var phase = Phase.IDLE
     private var batchStart = 0L
+    /**
+     * Sinyal yang terkumpul di window entry (akumulasi, stance terakhir per model).
+     * Ini yang dipakai menilai skema, karena window memang mengumpulkan jawaban.
+     */
     private val batch = LinkedHashMap<String, Sig>()
+    /**
+     * Model yang sinyalnya **non-zero SEKARANG** — sama dengan yang tampil di Home.
+     * Hanya dipakai untuk angka "aktif" di panel, supaya tidak ada lagi angka 3/6
+     * padahal Home cuma menunjukkan 2 model bersinyal.
+     */
+    private val liveSigs = LinkedHashMap<String, Sig>()
     private val latest = LinkedHashMap<String, Sig>()
+    /** Sinyal terakhir per model termasuk 0 (dipakai panel saat HOLDING). */
     private val current = LinkedHashMap<String, Int>()
     private val lastSeen = LinkedHashMap<String, Long>()
     /** Sinyal yang terkumpul selama window cek 25 menit (menit 0 = patokan tersentuh). */
     private val recheckSigs = LinkedHashMap<String, Sig>()
     /** Waktu snapshot terakhir saat patokan tersentuh; sinyal yang lebih lama tidak dihitung. */
     private var recheckSnapshotAt = 0L
+    /** Penjaga netral berkala Home selama Auto ON (lihat [AutoCommon.homeNeutralSec]). */
+    private var lastHomeNeutralAt = 0L
+    private var warnedNoScheme = false
     /**
      * Timestamp sinyal carry saat window digulirkan. Sinyal dengan `ts <= batchCarryAt`
      * adalah warisan window sebelumnya, bukan jawaban window berjalan.
@@ -188,11 +210,14 @@ class AutoEngine(private val ctx: Context) {
         phase = Phase.IDLE
         clearState()
         seeded = false
+        warnedNoScheme = false
+        lastHomeNeutralAt = System.currentTimeMillis()
         saveState()
         log("Auto ON — semua model dinetralkan, mulai mencari pola baru")
         ui {
             BinanceState.autoPhase = "IDLE"
-            BinanceState.autoDetail = "Menunggu pola 4/6 · window 30 menit"
+            BinanceState.autoDetail = "Menunggu sinyal pertama · window ${cfg.entryWindowMin} menit"
+            BinanceState.autoBlock = ""
         }
         neutralizeAllModels("Auto ON")
     }
@@ -205,6 +230,7 @@ class AutoEngine(private val ctx: Context) {
         ui {
             BinanceState.autoPhase = "OFF"
             BinanceState.autoDetail = "Auto mati · API siap manual"
+            BinanceState.autoBlock = ""
         }
     }
 
@@ -388,9 +414,15 @@ class AutoEngine(private val ctx: Context) {
 
         for (m in snap.models) {
             current[m.name] = m.side
-            if (m.side == 0) continue
+            if (m.side == 0) {
+                // Model netral lagi: keluar dari daftar "aktif sekarang", tapi jawaban yang
+                // sudah masuk window tetap disimpan (window memang mengumpulkan jawaban).
+                liveSigs.remove(m.name)
+                continue
+            }
             val sig = Sig(m.side, now)
             latest[m.name] = sig
+            liveSigs[m.name] = sig
             lastSeen[m.name] = now
             when (phase) {
                 Phase.IDLE, Phase.BATCH -> {
@@ -412,6 +444,7 @@ class AutoEngine(private val ctx: Context) {
 
     private suspend fun tick(now: Long, account: BinanceAccount, snap: SnapshotData) {
         if (snap.price > 0) lastMark = snap.price
+        keepHomeNeutral(now)
         val pos = account.positions.firstOrNull { it.symbol == SYMBOL }
         when (phase) {
             // posisi hilang saat HOLDING = tertutup SL keras/manual/likuidasi
@@ -425,10 +458,28 @@ class AutoEngine(private val ctx: Context) {
     }
 
     /**
-     * Evaluasi window entry. Alur tidak punya fase tunggu terpisah:
-     *  - Semua model yang disyaratkan skema sudah menjawab **di window ini** → putuskan sekarang.
-     *  - Gagal apa pun → aksi sesuai setelan (carry / reset / cooldown).
-     *  - Window habis → putuskan dengan data yang ada; kalau tidak lengkap → aksi gagal.
+     * Selama Auto ON, Home dipaksa netral berkala ([AutoCommon.homeNeutralSec]).
+     * Server membuka posisi lagi ±1 menit setelah netral, jadi tanpa ini akan selalu ada
+     * model yang "ditangguhkan" padahal Auto sudah ON.
+     */
+    private fun keepHomeNeutral(now: Long) {
+        val every = cfg.homeNeutralSec * 1000L
+        if (every <= 0) return
+        if (now - lastHomeNeutralAt < every) return
+        lastHomeNeutralAt = now
+        neutralizeAllModels("jaga netral Home")
+    }
+
+    /**
+     * Evaluasi window entry.
+     *
+     * Aturan revisi #31:
+     *  - Skema yang **cocok** langsung di-ACC kapan pun (tidak menunggu 30 menit), termasuk
+     *    skema yang hanya butuh beberapa model — jadi skema tanpa syarat 6/6 tetap bisa jalan.
+     *  - Kalau belum ada yang cocok, window tetap diberi waktu sampai batas 30 menit; skema
+     *    tidak dipotong waktunya hanya karena sinyal awal belum memenuhi.
+     *  - 6/6 sudah menjawab tapi tidak ada skema cocok → langsung dinilai gagal (tidak menunggu).
+     *  - Batas waktu habis → dinilai dengan sinyal yang ada, lalu aksi gagal dijalankan.
      */
     private suspend fun evaluateBatch(now: Long, snap: SnapshotData) {
         // Jeda (aksi COOLDOWN) berjalan sebelum window dimulai.
@@ -437,65 +488,97 @@ class AutoEngine(private val ctx: Context) {
             cooldownUntil = 0
             saveState()
         }
+        // Tidak ada skema aktif = Auto sengaja tidak entry/lanjut. Diam saja, jangan
+        // menggulir window terus-menerus.
+        if (cfg.activeEntrySchemes.isEmpty()) {
+            ui { BinanceState.autoBlock = "belum ada skema entry aktif — buat skema di tombol Atur" }
+            if (!warnedNoScheme) {
+                warnedNoScheme = true
+                log("belum ada skema entry aktif — Auto menunggu skema dibuat di tombol Atur")
+                notify("Belum ada skema entry aktif. Buat skema di menu Atur.")
+            }
+            return
+        }
+        warnedNoScheme = false
+        if (batch.isEmpty()) return
         val total = modelNames.size.coerceAtLeast(1)
         val deadline = batchStart + entryWindowMs
-        val required = requiredResponded(total)
-        val allResponded = batch.size >= required
-        // Sinyal carry berasal dari window sebelumnya; model harus mengirim sinyal BARU
-        // (ts > batchCarryAt) sebelum dianggap menjawab window ini.
-        val allFresh = allResponded && batch.values.all { it.ts > batchCarryAt }
-
-        if (allFresh) {
-            decideEntry(now, snap, "window ${cfg.entryWindowMin} menit lengkap")
-            return
-        }
-        if (now < deadline) return
-        rollWindow(
-            if (allResponded) "model belum menjawab ulang di window ini"
-            else "hanya ${batch.size}/$total merespon dalam ${cfg.entryWindowMin} menit",
-        )
-    }
-
-    /**
-     * Jumlah model yang wajib menjawab. Kalau ada beberapa skema entry aktif, dipakai
-     * syarat paling longgar supaya skema yang lebih ketat tetap bisa dinilai.
-     */
-    private fun requiredResponded(total: Int): Int {
-        val schemes = cfg.activeEntrySchemes.ifEmpty { cfg.entrySchemes }
-        val need = schemes.minOf { s ->
-            if (s.requireAllModels) total else s.minResponded.coerceIn(1, total)
-        }
-        return need.coerceIn(1, total)
-    }
-
-    /**
-     * Putuskan izin entry memakai **skema OR**: kalau ada minimal satu skema entry aktif yang
-     * cocok, langsung entry. Kalau tidak ada yang cocok, alasan dari skema terbaik dilaporkan.
-     */
-    private suspend fun decideEntry(now: Long, snap: SnapshotData, reason: String) {
-        val schemes = cfg.activeEntrySchemes
-        if (schemes.isEmpty()) {
-            failEntry("tidak ada skema entry yang aktif")
-            return
-        }
-        val total = modelNames.size.coerceAtLeast(1)
         val counts = countSides(batch)
         val majority = if (counts.longs >= counts.shorts) 1 else -1
         val agree = max(counts.longs, counts.shorts)
+        // Sinyal carry berasal dari window sebelumnya; model harus mengirim sinyal BARU
+        // (ts > batchCarryAt) sebelum dianggap menjawab window ini.
+        val allFresh = batch.values.all { it.ts > batchCarryAt }
 
-        val failures = ArrayList<String>()
-        for (scheme in schemes) {
-            val fail = schemeFail(scheme, batch, majority, agree, total, snap)
-            if (fail == null) {
+        if (allFresh) {
+            val hit = entrySchemeMatch(batch, majority, agree, total, snap)
+            if (hit != null) {
                 doEntry(
                     majority, cfg.entryLeverage, cfg.entryTp, cfg.entrySl,
-                    now, snap, "$reason · ${scheme.name} · $agree/$total",
+                    now, snap, "${batch.size}/$total merespon · ${hit.name} · $agree selaras",
                 )
                 return
             }
-            failures += "${scheme.name}: $fail"
         }
-        failEntry(failures.joinToString(" | "))
+        val allAnswered = batch.size >= total && allFresh
+        if (!allAnswered && now < deadline) return
+        failEntry(entryFailReasons(batch, majority, agree, total, snap))
+    }
+
+    /**
+     * Aksi saat skema entry gagal, mengikuti setelan aplikasi:
+     *  - CARRY: bawa sinyal carry lalu window baru (default, perilaku #28).
+     *  - RESET: netralkan semua model, window baru dari nol.
+     *  - COOLDOWN: netralkan semua model lalu diam [AutoCommon.entryFailCooldownMin] menit.
+     */
+    private suspend fun failEntry(reason: String) {
+        ui { BinanceState.autoBlock = reason }
+        when (cfg.entryFailAction.uppercase()) {
+            "RESET" -> {
+                log("skema gagal ($reason) — netral semua model, window baru")
+                neutralizeAllModels("window gagal")
+                resetWindow()
+            }
+            "COOLDOWN" -> {
+                val mins = cfg.entryFailCooldownMin.coerceAtLeast(1)
+                log("skema gagal ($reason) — netral semua, jeda $mins menit")
+                neutralizeAllModels("cooldown entry")
+                resetWindow()
+                cooldownUntil = System.currentTimeMillis() + mins * 60_000L
+                phase = Phase.BATCH
+                notify("Skema gagal. Jeda $mins menit.")
+                saveState()
+            }
+            else -> rollWindow(reason)
+        }
+    }
+
+    /**
+     * Skema entry pertama yang **cocok** (logika OR). Null kalau tidak ada yang cocok,
+     * atau kalau belum ada skema aktif.
+     */
+    private fun entrySchemeMatch(
+        sigs: Map<String, Sig>,
+        dir: Int,
+        agree: Int,
+        total: Int,
+        snap: SnapshotData,
+    ): SchemeRule? = cfg.activeEntrySchemes.firstOrNull { schemeFail(it, sigs, dir, agree, total, snap) == null }
+
+    /** Alasan setiap skema entry gagal, untuk log & panel ("Entry ditahan: …"). */
+    private fun entryFailReasons(
+        sigs: Map<String, Sig>,
+        dir: Int,
+        agree: Int,
+        total: Int,
+        snap: SnapshotData,
+    ): String {
+        val schemes = cfg.activeEntrySchemes
+        if (schemes.isEmpty()) return "belum ada skema entry aktif — buat skema di tombol Atur"
+        warnedNoScheme = false
+        return schemes.joinToString(" | ") { s ->
+            "${s.name}: ${schemeFail(s, sigs, dir, agree, total, snap) ?: "cocok"}"
+        }
     }
 
     /**
@@ -521,37 +604,11 @@ class AutoEngine(private val ctx: Context) {
         return null
     }
 
-    /**
-     * Aksi saat skema entry gagal, mengikuti setelan aplikasi:
-     *  - CARRY: bawa sinyal carry lalu window baru (default, perilaku #28).
-     *  - RESET: netralkan semua model, window baru dari nol.
-     *  - COOLDOWN: netralkan semua model lalu diam [AutoCommon.entryFailCooldownMin] menit.
-     */
-    private suspend fun failEntry(reason: String) {
-        when (cfg.entryFailAction.uppercase()) {
-            "RESET" -> {
-                log("skema gagal ($reason) — netral semua model, window baru")
-                neutralizeAllModels("window gagal")
-                resetWindow()
-            }
-            "COOLDOWN" -> {
-                val mins = cfg.entryFailCooldownMin.coerceAtLeast(1)
-                log("skema gagal ($reason) — netral semua, jeda $mins menit")
-                neutralizeAllModels("cooldown entry")
-                resetWindow()
-                cooldownUntil = System.currentTimeMillis() + mins * 60_000L
-                phase = Phase.BATCH
-                notify("Skema gagal. Jeda $mins menit.")
-                saveState()
-            }
-            else -> rollWindow(reason)
-        }
-    }
-
     /** Kosongkan window dan kembali menunggu sinyal pertama (jeda tidak diubah). */
     private suspend fun resetWindow() {
         batch.clear()
         latest.clear()
+        liveSigs.clear()
         batchStart = 0
         batchCarryAt = 0
         phase = Phase.IDLE
@@ -675,12 +732,14 @@ class AutoEngine(private val ctx: Context) {
 
         val total = modelNames.size.coerceAtLeast(1)
         val responded = recheckSigs.size
-        val required = requiredRecheckResponded(total)
-        if (responded < required) {
-            if (now < recheckUntil) return
-            recheckFail("cek ${cfg.recheckMin} menit gagal: hanya $responded/$total merespon", now)
-            return
+        // Aturan #31: begitu syarat responden salah satu skema recheck terpenuhi (termasuk
+        // 6/6), langsung dinilai tanpa menunggu. Selain itu tunggu sampai batas waktu, lalu
+        // **tetap bandingkan** skema dengan sinyal yang ada.
+        val ready = cfg.activeRecheckSchemes.any { s ->
+            val need = if (s.requireAllModels) total else s.minResponded.coerceIn(1, total)
+            responded >= need
         }
+        if (!ready && now < recheckUntil) return
 
         // Reversal global: dicek sebelum skema, sesuai keputusan #30.
         val reversed = reversalCount(recheckSigs, direction)
@@ -691,7 +750,7 @@ class AutoEngine(private val ctx: Context) {
 
         val schemes = cfg.activeRecheckSchemes
         if (schemes.isEmpty()) {
-            recheckFail("tidak ada skema recheck yang aktif", now)
+            recheckFail("tidak ada skema recheck aktif", now)
             return
         }
         val aligned = recheckSigs.values.count { it.side == direction }
@@ -704,16 +763,12 @@ class AutoEngine(private val ctx: Context) {
             }
             failures += "${scheme.name}: $fail"
         }
-        recheckFail(failures.joinToString(" | "), now)
-    }
-
-    /** Jumlah model yang wajib menjawab saat recheck (paling longgar di antara skema aktif). */
-    private fun requiredRecheckResponded(total: Int): Int {
-        val schemes = cfg.activeRecheckSchemes.ifEmpty { cfg.recheckSchemes }
-        val need = schemes.minOf { s ->
-            if (s.requireAllModels) total else s.minResponded.coerceIn(1, total)
+        val prefix = if (responded < total) {
+            "cek ${cfg.recheckMin} menit habis: $responded/$total merespon · "
+        } else {
+            ""
         }
-        return need.coerceIn(1, total)
+        recheckFail(prefix + failures.joinToString(" | "), now)
     }
 
     /** Skema recheck lolos → lanjutkan posisi yang SAMA dengan leverage & patokan berikutnya. */
@@ -754,6 +809,7 @@ class AutoEngine(private val ctx: Context) {
      *  - HOLD: pertahankan posisi dan buka cek baru selama [AutoCommon.recheckMin] menit.
      */
     private suspend fun recheckFail(reason: String, now: Long) {
+        ui { BinanceState.autoBlock = reason }
         if (cfg.recheckFailAction.equals("HOLD", ignoreCase = true)) {
             log("$reason — posisi DITAHAN, cek ${cfg.recheckMin} menit lagi")
             notify("$reason. Posisi ditahan, cek ulang.")
@@ -973,9 +1029,11 @@ class AutoEngine(private val ctx: Context) {
             phase = Phase.HOLDING
             batch.clear()
             latest.clear()
+            liveSigs.clear()
             recheckSigs.clear()
             seeded = true
             lastProtectCheck = now
+            ui { BinanceState.autoBlock = "" }
 
             log(
                 "posisi ${if (dir > 0) "LONG" else "SHORT"} @ ${priceText(entry)} · " +
@@ -1402,6 +1460,7 @@ class AutoEngine(private val ctx: Context) {
         current.clear()
         lastSeen.clear()
         recheckSigs.clear()
+        liveSigs.clear()
         batchStart = 0
         batchCarryAt = 0
         recheckStart = 0
@@ -1442,10 +1501,15 @@ class AutoEngine(private val ctx: Context) {
         var aligned = 0
         val detail = when (phase) {
             Phase.BATCH -> {
-                val counts = countSides(batch)
-                responded = batch.size
-                aligned = max(counts.longs, counts.shorts)
-                "Sinyal $responded/$total · sisa ${mmss(batchStart + entryWindowMs - now)}"
+                // Angka "respon" = model yang bersinyal SEKARANG (sama dengan Home).
+                // Jawaban yang sudah masuk window tetap dinilai (lihat batch).
+                responded = liveSigs.size
+                aligned = max(
+                    liveSigs.values.count { it.side > 0 },
+                    liveSigs.values.count { it.side < 0 },
+                )
+                "Sinyal $responded/$total aktif · ${batch.size}/$total terkumpul · " +
+                    "sisa ${mmss(batchStart + entryWindowMs - now)}"
             }
             Phase.HOLDING -> {
                 responded = modelNames.count { (current[it] ?: 0) != 0 }
@@ -1453,23 +1517,27 @@ class AutoEngine(private val ctx: Context) {
                 "${if (direction > 0) "LONG" else "SHORT"} ${leverage}x · ROI ${lastRoi.toInt()}% · target +${tpLevel.toInt()}% / -${slLevel.toInt()}%"
             }
             Phase.RECHECK -> {
-                responded = recheckSigs.size
-                aligned = recheckSigs.values.count { it.side == direction }
-                val reversed = reversalCount(recheckSigs, direction)
+                // Angka "aktif" mengikuti Home; jawaban yang terkumpul tetap dipakai menilai.
+                responded = liveSigs.size
+                aligned = liveSigs.values.count { it.side == direction }
+                val reversed = liveSigs.values.count { it.side == -direction }
                 val hit = if (recheckKind == "TP") "+${tpLevel.toInt()}%" else "-${slLevel.toInt()}%"
-                "Posisi MASIH JALAN ${leverage}x · ROI ${lastRoi.toInt()}% · model $responded/$total · " +
-                    "balik $reversed · cek $hit sisa ${mmss(recheckUntil - now)}"
+                "Posisi MASIH JALAN ${leverage}x · ROI ${lastRoi.toInt()}% · model $responded/$total aktif " +
+                    "(${recheckSigs.size} terkumpul) · balik $reversed · cek $hit sisa ${mmss(recheckUntil - now)}"
             }
-            Phase.IDLE -> if (cooldownUntil > now) {
-                "Jeda entry ${mmss(cooldownUntil - now)} · window ${cfg.entryWindowMin} menit"
-            } else {
-                "Menunggu pola ${cfg.entrySchemes.firstOrNull()?.minAgree ?: 0}/$total · " +
-                    "window ${cfg.entryWindowMin} menit"
+            Phase.IDLE -> {
+                responded = modelNames.count { (current[it] ?: 0) != 0 }
+                if (cooldownUntil > now) {
+                    "Jeda entry ${mmss(cooldownUntil - now)} · window ${cfg.entryWindowMin} menit"
+                } else {
+                    "Menunggu sinyal pertama · window ${cfg.entryWindowMin} menit"
+                }
             }
         }
         ui {
             BinanceState.autoPhase = phase.name
             BinanceState.autoDetail = detail
+            BinanceState.autoSchemes = cfg.activeEntrySchemes.size
             BinanceState.modelsResponded = responded
             BinanceState.modelsAligned = aligned
             BinanceState.modelCount = total

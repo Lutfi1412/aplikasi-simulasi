@@ -26,6 +26,10 @@ object BinanceState {
     var autoPhase by mutableStateOf("OFF")
     var autoDetail by mutableStateOf("API Binance mati")
     var autoLog by mutableStateOf<List<String>>(emptyList())
+    /** Jumlah skema entry yang aktif (0 = Auto tidak akan entry). */
+    var autoSchemes by mutableStateOf(0)
+    /** Alasan terakhir entry ditolak — supaya tidak perlu menebak dari log. */
+    var autoBlock by mutableStateOf("")
     var modelsResponded by mutableStateOf(0)
     var modelsAligned by mutableStateOf(0)
     var modelCount by mutableStateOf(6)

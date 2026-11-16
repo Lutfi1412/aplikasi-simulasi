@@ -78,6 +78,26 @@ data class SchemeRule(
         }
     }
 
+    /**
+     * Skema ini masih persis nilai bawaan aplikasi (belum pernah diedit)? Dipakai migrasi
+     * yang membuang skema bawaan lama supaya Auto hanya memakai skema buatan sendiri.
+     */
+    fun isUntouchedDefault(): Boolean {
+        val d = ENTRY_DEFAULT
+        return requireAllModels == d.requireAllModels &&
+            minResponded == d.minResponded &&
+            minAgree == d.minAgree &&
+            profitRuleEnabled == d.profitRuleEnabled &&
+            alignedMinRoi == d.alignedMinRoi &&
+            alignedMinCount == d.alignedMinCount &&
+            misalignedMaxRoi == d.misalignedMaxRoi &&
+            silentProfitBlockEnabled == d.silentProfitBlockEnabled &&
+            silentProfitMax == d.silentProfitMax &&
+            gapRuleEnabled == d.gapRuleEnabled &&
+            gapPct == d.gapPct &&
+            gapOnlyIfTopPositive == d.gapOnlyIfTopPositive
+    }
+
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
         put("name", name)
@@ -164,9 +184,15 @@ data class AutoCommon(
     val reversalEnabled: Boolean = true,
     val reversalMin: Int = 4,
 
-    // ---- daftar skema
-    val entrySchemes: List<SchemeRule> = listOf(SchemeRule.ENTRY_DEFAULT),
-    val recheckSchemes: List<SchemeRule> = listOf(SchemeRule.RECHECK_DEFAULT),
+    /**
+     * Selama Auto ON, Home dipaksa netral berkala setiap N detik supaya tidak ada model
+     * yang "ditangguhkan" setelah Auto ON. 0 = matikan.
+     */
+    val homeNeutralSec: Int = 60,
+
+    // ---- daftar skema (kosong = Auto tidak entry/lanjut sampai Anda menambah skema)
+    val entrySchemes: List<SchemeRule> = emptyList(),
+    val recheckSchemes: List<SchemeRule> = emptyList(),
 ) {
     /** Leverage entry pertama. */
     val entryLeverage: Int get() = leverageLadder.minOrNull() ?: 30
@@ -203,8 +229,9 @@ data class AutoCommon(
                 if (it in setOf("OUT", "HOLD")) it else "OUT"
             },
             reversalMin = reversalMin.coerceIn(1, 6),
-            entrySchemes = entrySchemes.map { it.sanitized() }.ifEmpty { listOf(SchemeRule.ENTRY_DEFAULT) },
-            recheckSchemes = recheckSchemes.map { it.sanitized() }.ifEmpty { listOf(SchemeRule.RECHECK_DEFAULT) },
+            homeNeutralSec = homeNeutralSec.coerceIn(0, 600),
+            entrySchemes = entrySchemes.map { it.sanitized() },
+            recheckSchemes = recheckSchemes.map { it.sanitized() },
         )
     }
 
@@ -226,6 +253,7 @@ data class AutoCommon(
         put("recheckFailAction", recheckFailAction)
         put("reversalEnabled", reversalEnabled)
         put("reversalMin", reversalMin)
+        put("homeNeutralSec", homeNeutralSec)
         put("entrySchemes", JSONArray(entrySchemes.map { it.toJson() }))
         put("recheckSchemes", JSONArray(recheckSchemes.map { it.toJson() }))
     }.toString()
@@ -233,44 +261,18 @@ data class AutoCommon(
     companion object {
         val STANDARD = AutoCommon()
 
+        /** Angka umum yang lebih ketat; **daftar skema tidak diubah** (skema milik Anda). */
         val CONSERVATIVE = AutoCommon(
             leverageLadder = listOf(25, 30, 35),
-            entrySchemes = listOf(
-                SchemeRule(
-                    id = "entry-c1", name = "Konservatif 5/6",
-                    minAgree = 5, alignedMinRoi = 55.0, alignedMinCount = 3,
-                    misalignedMaxRoi = -40.0, gapPct = 25.0,
-                ),
-            ),
-            recheckSchemes = listOf(
-                SchemeRule(
-                    id = "recheck-c1", name = "Recheck ketat 5/6",
-                    minAgree = 5, alignedMinRoi = 55.0, alignedMinCount = 3,
-                    misalignedMaxRoi = -40.0, gapPct = 25.0,
-                ),
-            ),
             reversalMin = 5,
         )
 
+        /** Angka umum yang lebih longgar; **daftar skema tidak diubah** (skema milik Anda). */
         val AGGRESSIVE = AutoCommon(
             leverageLadder = listOf(30, 40, 50),
             maxLeverage = 50,
             tpLadder = listOf(20.0, 40.0, 60.0),
             slLadder = listOf(20.0, 30.0, 45.0),
-            entrySchemes = listOf(
-                SchemeRule(
-                    id = "entry-a1", name = "Agresif 3/6",
-                    minAgree = 3, alignedMinRoi = 40.0, alignedMinCount = 2,
-                    misalignedMaxRoi = -25.0, gapPct = 30.0,
-                ),
-            ),
-            recheckSchemes = listOf(
-                SchemeRule(
-                    id = "recheck-a1", name = "Recheck longgar 3/6",
-                    minAgree = 3, alignedMinRoi = 40.0, alignedMinCount = 2,
-                    misalignedMaxRoi = -25.0, gapPct = 30.0,
-                ),
-            ),
             reversalMin = 3,
         )
 
@@ -329,6 +331,7 @@ data class AutoCommon(
                     recheckFailAction = o.optString("recheckFailAction", "OUT"),
                     reversalEnabled = o.optBoolean("reversalEnabled", true),
                     reversalMin = o.optInt("reversalMin", 4),
+                    homeNeutralSec = o.optInt("homeNeutralSec", 60),
                     entrySchemes = schemes(o.optJSONArray("entrySchemes"), legacyScheme, SchemeRule.ENTRY_DEFAULT),
                     recheckSchemes = schemes(
                         o.optJSONArray("recheckSchemes"), legacyScheme, SchemeRule.RECHECK_DEFAULT,
@@ -339,13 +342,26 @@ data class AutoCommon(
             }
         }
 
+        /**
+         * Daftar skema tersimpan. **Daftar kosong dihormati** (Auto tidak entry sampai skema
+         * dibuat sendiri); skema default hanya dipakai untuk memigrasi config format lama.
+         *
+         * Skema bawaan aplikasi yang belum pernah diedit (id + nama + semua syarat masih
+         * default) dibuang, supaya Auto hanya memakai skema buatan Anda sendiri.
+         */
         private fun schemes(a: JSONArray?, legacy: SchemeRule?, fallback: SchemeRule): List<SchemeRule> {
-            if (a == null || a.length() == 0) {
+            if (a == null) {
                 return listOf(legacy?.copy(id = fallback.id, name = fallback.name) ?: fallback)
             }
             val out = ArrayList<SchemeRule>()
-            for (i in 0 until a.length()) out += SchemeRule.fromJson(a.optJSONObject(i))
-            return out.ifEmpty { listOf(fallback) }
+            for (i in 0 until a.length()) {
+                val s = SchemeRule.fromJson(a.optJSONObject(i))
+                val stock = s.id in setOf("entry-1", "recheck-1") &&
+                    s.name in setOf("Entry standar", "Recheck standar") &&
+                    s.isUntouchedDefault()
+                if (!stock) out += s
+            }
+            return out
         }
 
         private fun intList(a: JSONArray?, fallback: List<Int>): List<Int> {

@@ -462,6 +462,23 @@ fun BinanceScreen(modifier: Modifier = Modifier) {
             }
             Spacer(Modifier.height(2.dp))
             Text(BinanceState.autoDetail, color = CMute, fontSize = 10.sp)
+            if (BinanceState.autoEnabled) {
+                Spacer(Modifier.height(2.dp))
+                if (BinanceState.autoSchemes == 0) {
+                    Text(
+                        "Belum ada skema entry aktif — Auto tidak akan entry sampai Anda membuat skema.",
+                        color = CAmber,
+                        fontSize = 9.sp,
+                    )
+                } else if (BinanceState.autoBlock.isNotBlank()) {
+                    Text(
+                        "Entry ditahan: ${BinanceState.autoBlock}",
+                        color = CMute,
+                        fontSize = 9.sp,
+                        lineHeight = 12.sp,
+                    )
+                }
+            }
             Spacer(Modifier.height(4.dp))
             Text(
                 "Leverage ${BinanceState.leverage}x · patokan app +${BinanceState.tpLevel.toInt()}% / " +
@@ -668,9 +685,9 @@ private fun RowScopeSpacer() {
 
 private fun phaseLabel(phase: String): String = when (phase) {
     "IDLE" -> "Mencari pola"
-    "BATCH" -> "Mengumpulkan sinyal (30 menit)"
+    "BATCH" -> "Mengumpulkan sinyal"
     "HOLDING" -> "Posisi terbuka"
-    "RECHECK" -> "Cek ulang model (25 menit)"
+    "RECHECK" -> "Cek ulang model"
     else -> "Auto off"
 }
 

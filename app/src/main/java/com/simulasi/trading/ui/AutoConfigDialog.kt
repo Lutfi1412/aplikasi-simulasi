@@ -129,19 +129,34 @@ fun AutoConfigDialog(
                 Spacer(Modifier.height(6.dp))
                 Row {
                     OutlinedButton(
-                        onClick = { draft = AutoCommon.STANDARD },
+                        onClick = { draft = draft.copy(homeNeutralSec = 60) },
                         modifier = Modifier.weight(1f),
-                    ) { Text("Default", fontSize = 11.sp, color = D_MUTE) }
+                    ) { Text("Netral Home", fontSize = 10.sp, color = D_MUTE) }
                     Spacer(Modifier.width(6.dp))
                     OutlinedButton(
-                        onClick = { draft = AutoCommon.CONSERVATIVE },
+                        onClick = {
+                            draft = draft.copy(
+                                entryWindowMin = 30,
+                                carryMin = 5,
+                                recheckMin = 25,
+                                leverageLadder = listOf(30, 35, 40),
+                                leverageStep = 5,
+                                maxLeverage = 40,
+                                tpLadder = listOf(22.0, 34.0, 50.0, 65.0),
+                                tpStep = 15.0,
+                                tpExtend = true,
+                                slLadder = listOf(22.0, 31.0, 40.0),
+                                slStep = 10.0,
+                                slExtend = false,
+                                entryFailAction = "CARRY",
+                                entryFailCooldownMin = 30,
+                                recheckFailAction = "OUT",
+                                reversalEnabled = true,
+                                reversalMin = 4,
+                            )
+                        },
                         modifier = Modifier.weight(1f),
-                    ) { Text("Konservatif", fontSize = 10.sp, color = D_MUTE) }
-                    Spacer(Modifier.width(6.dp))
-                    OutlinedButton(
-                        onClick = { draft = AutoCommon.AGGRESSIVE },
-                        modifier = Modifier.weight(1f),
-                    ) { Text("Agresif", fontSize = 10.sp, color = D_MUTE) }
+                    ) { Text("Reset angka", fontSize = 10.sp, color = D_MUTE) }
                 }
                 Spacer(Modifier.height(6.dp))
                 Button(
@@ -197,6 +212,10 @@ private fun UmumTab(cfg: AutoCommon, onChange: (AutoCommon) -> Unit) {
         "Cek recheck", cfg.recheckMin, 5, 240, 1, "menit",
         "Batas waktu model menjawab saat patokan tersentuh.",
     ) { onChange(cfg.copy(recheckMin = it)) }
+    IntRow(
+        "Netral Home tiap", cfg.homeNeutralSec, 0, 600, 10, "detik",
+        "Selama Auto ON, Home dipaksa netral berkala supaya tidak ada model yang tertahan. 0 = mati.",
+    ) { onChange(cfg.copy(homeNeutralSec = it)) }
 
     GroupTitle("TANGGA LEVERAGE (ENTRY → NAIK TIAP LOLOS CEK)")
     LadderRow(
@@ -354,6 +373,15 @@ private fun SchemeTab(
         },
         modifier = Modifier.fillMaxWidth(),
     ) { Text("+ Tambah skema", fontSize = 10.sp, color = D_CYAN) }
+    if (schemes.isEmpty()) {
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Belum ada skema. Auto tidak akan entry/lanjut sampai minimal satu skema aktif dibuat.",
+            color = D_AMBER,
+            fontSize = 8.sp,
+            lineHeight = 11.sp,
+        )
+    }
 
     editing?.let { scheme ->
         SchemeEditorDialog(
