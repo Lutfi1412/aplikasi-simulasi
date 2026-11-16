@@ -184,12 +184,6 @@ data class AutoCommon(
     val reversalEnabled: Boolean = true,
     val reversalMin: Int = 4,
 
-    /**
-     * Selama Auto ON, Home dipaksa netral berkala setiap N detik supaya tidak ada model
-     * yang "ditangguhkan" setelah Auto ON. 0 = matikan.
-     */
-    val homeNeutralSec: Int = 60,
-
     // ---- daftar skema (kosong = Auto tidak entry/lanjut sampai Anda menambah skema)
     val entrySchemes: List<SchemeRule> = emptyList(),
     val recheckSchemes: List<SchemeRule> = emptyList(),
@@ -229,7 +223,6 @@ data class AutoCommon(
                 if (it in setOf("OUT", "HOLD")) it else "OUT"
             },
             reversalMin = reversalMin.coerceIn(1, 6),
-            homeNeutralSec = homeNeutralSec.coerceIn(0, 600),
             entrySchemes = entrySchemes.map { it.sanitized() },
             recheckSchemes = recheckSchemes.map { it.sanitized() },
         )
@@ -253,7 +246,6 @@ data class AutoCommon(
         put("recheckFailAction", recheckFailAction)
         put("reversalEnabled", reversalEnabled)
         put("reversalMin", reversalMin)
-        put("homeNeutralSec", homeNeutralSec)
         put("entrySchemes", JSONArray(entrySchemes.map { it.toJson() }))
         put("recheckSchemes", JSONArray(recheckSchemes.map { it.toJson() }))
     }.toString()
@@ -331,7 +323,6 @@ data class AutoCommon(
                     recheckFailAction = o.optString("recheckFailAction", "OUT"),
                     reversalEnabled = o.optBoolean("reversalEnabled", true),
                     reversalMin = o.optInt("reversalMin", 4),
-                    homeNeutralSec = o.optInt("homeNeutralSec", 60),
                     entrySchemes = schemes(o.optJSONArray("entrySchemes"), legacyScheme, SchemeRule.ENTRY_DEFAULT),
                     recheckSchemes = schemes(
                         o.optJSONArray("recheckSchemes"), legacyScheme, SchemeRule.RECHECK_DEFAULT,

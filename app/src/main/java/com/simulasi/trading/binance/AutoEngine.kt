@@ -51,11 +51,13 @@ import kotlin.math.min
  *
  * Revisi #31:
  *  - "Respon" = model yang sinyalnya **non-zero SEKARANG** (sama dengan Home), bukan model
- *    yang pernah bersinyal lalu kembali netral. Sinyal yang kembali 0 dikeluarkan dari window.
- *  - Window habis (30 menit) tetap **dibandingkan** dulu dengan data yang ada; kalau semua
- *    skema gagal baru aksi gagal (carry/reset/cooldown) dijalankan.
- *  - Home dijaga netral berkala ([AutoCommon.homeNeutralSec]) supaya tidak ada model yang
- *    "ditangguhkan" setelah Auto ON.
+ *    yang pernah bersinyal lalu kembali netral. Panel menampilkan angka aktif + terkumpul.
+ *  - Skema yang cocok langsung **ACC** (tidak menunggu 30 menit); window 30 menit hanya batas
+ *    tunggu, dan setelah habis tetap **dibandingkan** sebelum aksi gagal dijalankan.
+ *  - Netral Home hanya di tiga momen ([poin di bawah]): Auto ON, window/skema gagal, dan cek
+ *    recheck gagal. Hasil netral **diverifikasi** (diulang) karena server bisa melewati bot
+ *    yang harganya belum tersedia.
+ *  - Tidak ada skema bawaan: Auto memakai skema buatan pengguna; kalau kosong, Auto diam.
  *
  * Sumber sinyal: /api/snapshot (6 model, sinyal per menit + roiPct untuk skema profit/gap).
  * Kredensial: BinanceStore (Android Keystore). Tidak ada kunci yang dikirim ke VPS.
@@ -68,6 +70,9 @@ class AutoEngine(private val ctx: Context) {
         private const val SYMBOL = "SOLUSDT"
         private const val SNAPSHOT_EVERY_MS = 30_000L
         private const val PROTECT_CHECK_MS = 30_000L
+        /** Berapa kali netral-all diulang kalau masih ada bot Home yang memegang posisi. */
+        private const val NEUTRAL_ATTEMPTS = 5
+        private const val NEUTRAL_RETRY_MS = 2_000L
 
         private val DEFAULT_MODELS = listOf(
             "Aturan dominasi",
@@ -126,8 +131,6 @@ class AutoEngine(private val ctx: Context) {
     private val recheckSigs = LinkedHashMap<String, Sig>()
     /** Waktu snapshot terakhir saat patokan tersentuh; sinyal yang lebih lama tidak dihitung. */
     private var recheckSnapshotAt = 0L
-    /** Penjaga netral berkala Home selama Auto ON (lihat [AutoCommon.homeNeutralSec]). */
-    private var lastHomeNeutralAt = 0L
     private var warnedNoScheme = false
     /**
      * Timestamp sinyal carry saat window digulirkan. Sinyal dengan `ts <= batchCarryAt`
@@ -211,7 +214,6 @@ class AutoEngine(private val ctx: Context) {
         clearState()
         seeded = false
         warnedNoScheme = false
-        lastHomeNeutralAt = System.currentTimeMillis()
         saveState()
         log("Auto ON — semua model dinetralkan, mulai mencari pola baru")
         ui {
@@ -219,7 +221,12 @@ class AutoEngine(private val ctx: Context) {
             BinanceState.autoDetail = "Menunggu sinyal pertama · window ${cfg.entryWindowMin} menit"
             BinanceState.autoBlock = ""
         }
-        neutralizeAllModels("Auto ON")
+        // Netral sekali di awal Auto ON, lalu diverifikasi (diulang kalau server melewati
+        // bot yang harganya belum tersedia). Tidak ada netral berkala setelah ini.
+        scope.launch {
+            val clean = neutralizeServerBots("Auto ON")
+            if (!clean) log("Auto ON: sebagian model Home masih punya posisi (harga feed belum ada) — akan dibersihkan saat window gagal")
+        }
     }
 
     fun onAutoDisabled() {
@@ -260,9 +267,14 @@ class AutoEngine(private val ctx: Context) {
     }
 
     /**
-     * Semua kejadian "netral" juga menetralkan keenam model simulasi di Home, bukan hanya
-     * posisi Binance — sesuai aturan "kalau sudah nyentuh patokan semua model dinetralkan
-     * kembali". Dijalankan di latar belakang supaya loop engine tidak tertahan.
+     * Netralkan keenam model simulasi di Home (bukan posisi Binance).
+     *
+     * Dipakai **hanya** di tiga kejadian: Auto ON, window/skema entry gagal, dan cek recheck
+     * gagal/berbalik arah. Tidak ada netral berkala — setelah itu Home bebas trading lagi.
+     *
+     * Server bisa **melewati** bot yang punya posisi kalau harga feed sedang tidak tersedia
+     * (`neutralize()` menolak saat `price <= 0`), dan itu penyebab "sesekali ada model yang
+     * tidak ikut netral". Karena itu hasilnya diverifikasi dan diulang beberapa kali.
      */
     private fun neutralizeAllModels(reason: String) {
         scope.launch {
@@ -270,32 +282,80 @@ class AutoEngine(private val ctx: Context) {
         }
     }
 
-    /** Panggil endpoint server supaya 6 bot simulasi di Home benar-benar netral. */
-    private suspend fun neutralizeServerBots(reason: String = "Auto ON") {
+    /**
+     * POST netral-all lalu **verifikasi** dari `/api/snapshot`: bot yang masih punya
+     * posisi/pending berarti server melewatinya (harga belum ada) → ulangi.
+     * @return true kalau semua bot sudah bersih.
+     */
+    private suspend fun neutralizeServerBots(reason: String = "Auto ON"): Boolean {
+        val body = "{}".toRequestBody("application/json".toMediaType())
+        var remaining = -1
+        for (attempt in 1..NEUTRAL_ATTEMPTS) {
+            val ok = try {
+                val req = Request.Builder()
+                    .url("${Prefs.baseUrl(ctx)}/api/bots/neutralize-all")
+                    .post(body)
+                    .header("cache-control", "no-store")
+                    .build()
+                http.newCall(req).execute().use { resp ->
+                    val text = resp.body?.string().orEmpty()
+                    if (!resp.isSuccessful) {
+                        log("netral server gagal: HTTP ${resp.code}")
+                        false
+                    } else {
+                        val j = runCatching { JSONObject(text) }.getOrNull()
+                        val n = j?.optInt("neutralized", 0) ?: 0
+                        val total = j?.optInt("bots", 0) ?: 0
+                        log(
+                            if (n > 0) "server ($reason): $n/$total model dipaksa netral"
+                            else "server ($reason): semua model sudah netral",
+                        )
+                        serverNeutralAt = System.currentTimeMillis()
+                        true
+                    }
+                }
+            } catch (e: Exception) {
+                log("netral server gagal: ${e.message}")
+                false
+            }
+
+            if (ok) {
+                remaining = countBotsHolding()
+                if (remaining == 0) return true
+                if (remaining > 0) {
+                    log("netral ulang ($reason): $remaining model masih punya posisi (harga feed belum ada)")
+                }
+            }
+            if (attempt < NEUTRAL_ATTEMPTS) delay(NEUTRAL_RETRY_MS)
+        }
+        return remaining == 0
+    }
+
+    /** Jumlah bot Home yang masih memegang posisi/entry tertunda. -1 kalau tidak terbaca. */
+    private suspend fun countBotsHolding(): Int = withContext(Dispatchers.IO) {
         try {
-            val body = "{}".toRequestBody("application/json".toMediaType())
             val req = Request.Builder()
-                .url("${Prefs.baseUrl(ctx)}/api/bots/neutralize-all")
-                .post(body)
+                .url("${Prefs.baseUrl(ctx)}/api/snapshot")
                 .header("cache-control", "no-store")
                 .build()
             http.newCall(req).execute().use { resp ->
-                val text = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    log("netral server gagal: HTTP ${resp.code}")
-                    return
+                if (!resp.isSuccessful) return@withContext -1
+                val j = JSONObject(resp.body?.string().orEmpty())
+                val arr = j.optJSONArray("bots") ?: return@withContext 0
+                var n = 0
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    if (o.optBoolean("neutralizable", false) ||
+                        o.optJSONObject("position") != null ||
+                        o.optJSONObject("pending") != null
+                    ) {
+                        n++
+                    }
                 }
-                val j = runCatching { JSONObject(text) }.getOrNull()
-                val n = j?.optInt("neutralized", 0) ?: 0
-                val total = j?.optInt("bots", 0) ?: 0
-                log(
-                    if (n > 0) "server ($reason): $n/$total model dipaksa netral"
-                    else "server ($reason): semua model sudah netral",
-                )
-                serverNeutralAt = System.currentTimeMillis()
+                n
             }
-        } catch (e: Exception) {
-            log("netral server gagal: ${e.message}")
+        } catch (_: Exception) {
+            -1
         }
     }
 
@@ -444,7 +504,6 @@ class AutoEngine(private val ctx: Context) {
 
     private suspend fun tick(now: Long, account: BinanceAccount, snap: SnapshotData) {
         if (snap.price > 0) lastMark = snap.price
-        keepHomeNeutral(now)
         val pos = account.positions.firstOrNull { it.symbol == SYMBOL }
         when (phase) {
             // posisi hilang saat HOLDING = tertutup SL keras/manual/likuidasi
@@ -455,19 +514,6 @@ class AutoEngine(private val ctx: Context) {
             Phase.IDLE -> if (pos != null) adopt(pos)
         }
         publishAuto()
-    }
-
-    /**
-     * Selama Auto ON, Home dipaksa netral berkala ([AutoCommon.homeNeutralSec]).
-     * Server membuka posisi lagi ±1 menit setelah netral, jadi tanpa ini akan selalu ada
-     * model yang "ditangguhkan" padahal Auto sudah ON.
-     */
-    private fun keepHomeNeutral(now: Long) {
-        val every = cfg.homeNeutralSec * 1000L
-        if (every <= 0) return
-        if (now - lastHomeNeutralAt < every) return
-        lastHomeNeutralAt = now
-        neutralizeAllModels("jaga netral Home")
     }
 
     /**
@@ -908,23 +954,39 @@ class AutoEngine(private val ctx: Context) {
     private fun neutralizeModels(models: List<String>, reason: String) {
         if (models.isEmpty()) return
         scope.launch {
+            val failed = ArrayList<String>()
             for (name in models) {
-                try {
-                    val body = JSONObject().put("id", name).toString()
-                        .toRequestBody("application/json".toMediaType())
-                    val req = Request.Builder()
-                        .url("${Prefs.baseUrl(ctx)}/api/bots/neutral")
-                        .post(body)
-                        .header("cache-control", "no-store")
-                        .build()
-                    http.newCall(req).execute().use { resp ->
-                        if (!resp.isSuccessful) log("netral $name gagal: HTTP ${resp.code}")
+                var done = false
+                for (attempt in 1..NEUTRAL_ATTEMPTS) {
+                    try {
+                        val body = JSONObject().put("id", name).toString()
+                            .toRequestBody("application/json".toMediaType())
+                        val req = Request.Builder()
+                            .url("${Prefs.baseUrl(ctx)}/api/bots/neutral")
+                            .post(body)
+                            .header("cache-control", "no-store")
+                            .build()
+                        http.newCall(req).execute().use { resp ->
+                            // 404 = tidak ada posisi/pending (atau id tidak dikenal) → tidak ada
+                            // yang perlu dinetralkan, jadi dianggap selesai.
+                            if (resp.isSuccessful || resp.code == 404) {
+                                done = true
+                            } else {
+                                log("netral $name gagal: HTTP ${resp.code}")
+                            }
+                        }
+                    } catch (e: Exception) {
+                        log("netral $name gagal: ${e.message}")
                     }
-                } catch (e: Exception) {
-                    log("netral $name gagal: ${e.message}")
+                    if (done) break
+                    if (attempt < NEUTRAL_ATTEMPTS) delay(NEUTRAL_RETRY_MS)
                 }
+                if (!done) failed += name
             }
-            log("server ($reason): ${models.size} model dipaksa netral")
+            log(
+                if (failed.isEmpty()) "server ($reason): ${models.size} model dipaksa netral"
+                else "server ($reason): ${models.size - failed.size} netral, gagal: ${failed.joinToString(", ")}",
+            )
         }
     }
 

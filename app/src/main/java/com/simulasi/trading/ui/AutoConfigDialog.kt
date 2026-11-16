@@ -129,11 +129,6 @@ fun AutoConfigDialog(
                 Spacer(Modifier.height(6.dp))
                 Row {
                     OutlinedButton(
-                        onClick = { draft = draft.copy(homeNeutralSec = 60) },
-                        modifier = Modifier.weight(1f),
-                    ) { Text("Netral Home", fontSize = 10.sp, color = D_MUTE) }
-                    Spacer(Modifier.width(6.dp))
-                    OutlinedButton(
                         onClick = {
                             draft = draft.copy(
                                 entryWindowMin = 30,
@@ -155,8 +150,8 @@ fun AutoConfigDialog(
                                 reversalMin = 4,
                             )
                         },
-                        modifier = Modifier.weight(1f),
-                    ) { Text("Reset angka", fontSize = 10.sp, color = D_MUTE) }
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Reset angka umum (skema tidak dihapus)", fontSize = 10.sp, color = D_MUTE) }
                 }
                 Spacer(Modifier.height(6.dp))
                 Button(
@@ -212,10 +207,6 @@ private fun UmumTab(cfg: AutoCommon, onChange: (AutoCommon) -> Unit) {
         "Cek recheck", cfg.recheckMin, 5, 240, 1, "menit",
         "Batas waktu model menjawab saat patokan tersentuh.",
     ) { onChange(cfg.copy(recheckMin = it)) }
-    IntRow(
-        "Netral Home tiap", cfg.homeNeutralSec, 0, 600, 10, "detik",
-        "Selama Auto ON, Home dipaksa netral berkala supaya tidak ada model yang tertahan. 0 = mati.",
-    ) { onChange(cfg.copy(homeNeutralSec = it)) }
 
     GroupTitle("TANGGA LEVERAGE (ENTRY → NAIK TIAP LOLOS CEK)")
     LadderRow(
